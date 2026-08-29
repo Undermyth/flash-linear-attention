@@ -84,6 +84,7 @@ def chunk_fwd_mesa_net_bwd(
     do: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_CG_iteration: int = 30,
+    eps: float = 0.0,
     chunk_size: int = 64,
     h_kk_init: torch.Tensor | None = None,
     h_kv_init: torch.Tensor | None = None,
@@ -142,6 +143,7 @@ def chunk_fwd_mesa_net_bwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         max_CG_iteration=max_CG_iteration,
+        eps=eps,
         output_dtype=torch.float16,
         chunk_indices=chunk_indices,
     )
@@ -240,6 +242,7 @@ class ChunkMesaNetFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
         )
         ctx.max_CG_iteration = max_CG_iteration
+        ctx.eps = eps
         ctx.chunk_size = chunk_size
         ctx.cu_seqlens = cu_seqlens
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -281,6 +284,7 @@ class ChunkMesaNetFunction(torch.autograd.Function):
         ) = ctx.saved_tensors
 
         max_CG_iteration = ctx.max_CG_iteration
+        eps = ctx.eps
         chunk_size = ctx.chunk_size
         cu_seqlens = ctx.cu_seqlens
         dq, dk, dv, dg, dbeta, dlamb, dh0_kk, dh0_kv = chunk_fwd_mesa_net_bwd(
@@ -294,6 +298,7 @@ class ChunkMesaNetFunction(torch.autograd.Function):
             do=do,
             cu_seqlens=cu_seqlens,
             max_CG_iteration=max_CG_iteration,
+            eps=eps,
             chunk_size=chunk_size,
             h_kk_init=h_kk_init,
             h_kv_init=h_kv_init,
