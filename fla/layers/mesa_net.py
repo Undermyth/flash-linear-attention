@@ -69,6 +69,7 @@ class MesaNet(nn.Module):
         layer_idx: int = None,
         norm_eps: float = 1e-5,
         lambda_lower_bound: float = 0.25,
+        cg_eps: float = 1e-3,
         max_cg_step_training: int = 30,
         max_cg_step_decoding: int = 30,
         **kwargs,
@@ -89,6 +90,7 @@ class MesaNet(nn.Module):
         self.head_v_dim = self.head_dim
         self.layer_idx = layer_idx
         self.lambda_lower_bound = lambda_lower_bound
+        self.cg_eps = cg_eps
         self.max_cg_step_training = max_cg_step_training
         self.max_cg_step_decoding = max_cg_step_decoding
 
@@ -185,6 +187,7 @@ class MesaNet(nn.Module):
                 lamb=lamb,
                 output_final_state=use_cache,
                 max_CG_iteration=self.max_cg_step_training,
+                eps=self.cg_eps,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=cu_seqlens,
             )

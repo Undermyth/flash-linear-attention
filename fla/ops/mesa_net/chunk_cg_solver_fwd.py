@@ -30,6 +30,27 @@ def chunk_update_once(
     return b_o
 
 
+@triton.jit()
+def chunk_cg_step(
+    b_x,
+    b_p,
+    b_r,
+    b_delta_old,
+    b_k,
+    b_m,
+    b_g_exp_q,
+    b_h,
+    b_lamb,
+):
+    b_o = chunk_update_once(b_p, b_k, b_k, b_m, b_g_exp_q, b_h, b_lamb)
+    alpha = b_delta_old / (tl.sum(b_p*b_o, axis=1) + 1e-5)
+    b_x += alpha[:, None] * b_p
+    b_r = b_r - alpha[:, None] * b_o
+    b_delta_new = tl.sum(b_r*b_r, axis=1)
+    b_p = b_r + (b_delta_new / (b_delta_old + 1e-5))[:, None] * b_p
+    return b_x, b_p, b_r, b_delta_new
+
+
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -49,6 +70,7 @@ def chunk_fwd_mesa_cg_dim64_kernel(
     chunk_indices,
     T,
     max_CG_iteration: tl.constexpr,
+    eps: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
@@ -117,14 +139,21 @@ def chunk_fwd_mesa_cg_dim64_kernel(
     b_r += b_q
     b_p += b_r
     b_delta_old = tl.sum(b_r*b_r, axis=1)
-    for i in range(max_CG_iteration):
-        b_o = chunk_update_once(b_p, b_k, b_k, b_m, b_g_exp_q, b_h, b_lamb)
-        alpha = b_delta_old / (tl.sum(b_p*b_o, axis=1) + 1e-5)
-        b_x += alpha[:, None] * b_p
-        b_r = b_r - alpha[:, None] * b_o
-        b_delta_new = tl.sum(b_r*b_r, axis=1)
-        b_p = b_r + (b_delta_new / (b_delta_old + 1e-5))[:, None] * b_p
-        b_delta_old = b_delta_new
+    # Exit as soon as the largest per-row residual ||r|| in this chunk drops below `eps`. Residuals
+    # are tracked as squared norms, so the tolerance is squared as well. Triton has no `break`, so
+    # an early exit requires a while loop; `eps` <= 0 keeps the plain `for` loop, which is faster
+    # than a while loop that can never exit early.
+    b_delta_tol: tl.constexpr = eps * eps
+    if eps > 0:
+        i = 0
+        while i < max_CG_iteration and tl.max(b_delta_old) >= b_delta_tol:
+            b_x, b_p, b_r, b_delta_old = chunk_cg_step(
+                b_x, b_p, b_r, b_delta_old, b_k, b_m, b_g_exp_q, b_h, b_lamb)
+            i += 1
+    else:
+        for _ in range(max_CG_iteration):
+            b_x, b_p, b_r, b_delta_old = chunk_cg_step(
+                b_x, b_p, b_r, b_delta_old, b_k, b_m, b_g_exp_q, b_h, b_lamb)
 
     p_q_final = q_final + o_t[:, None] * (H*K) + o_k[None, :]
     tl.store(p_q_final, b_x.to(p_q_final.dtype.element_ty), mask=m_tk)
@@ -150,6 +179,7 @@ def chunk_mesa_cg_fwd(
     cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
     max_CG_iteration: int = 30,
+    eps: float = 0.0,
     output_dtype: torch.dtype | None = None,
     chunk_indices: torch.LongTensor | None = None,
 ) -> torch.Tensor:
@@ -182,6 +212,7 @@ def chunk_mesa_cg_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         max_CG_iteration=max_CG_iteration,
+        eps=eps,
         T=T,
         H=H,
         K=K,

@@ -28,6 +28,7 @@ def chunk_fwd_mesa_net_fwd(
     lamb: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_CG_iteration: int = 30,
+    eps: float = 0.0,
     chunk_size: int = 64,
     h_kk_init: torch.Tensor | None = None,
     h_kv_init: torch.Tensor | None = None,
@@ -66,6 +67,7 @@ def chunk_fwd_mesa_net_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         max_CG_iteration=max_CG_iteration,
+        eps=eps,
         chunk_indices=chunk_indices,
     )
     return g, q_star, o, (h_kk_final, h_kv_final)
@@ -197,6 +199,7 @@ class ChunkMesaNetFunction(torch.autograd.Function):
         cu_seqlens,
         cu_seqlens_cpu,
         max_CG_iteration,
+        eps,
         h_kk_init,
         h_kv_init,
         output_final_state,
@@ -229,6 +232,7 @@ class ChunkMesaNetFunction(torch.autograd.Function):
             lamb=lamb,
             cu_seqlens=cu_seqlens,
             max_CG_iteration=max_CG_iteration,
+            eps=eps,
             chunk_size=chunk_size,
             h_kk_init=h_kk_init,
             h_kv_init=h_kv_init,
@@ -300,7 +304,7 @@ class ChunkMesaNetFunction(torch.autograd.Function):
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)
-        return dq, dk, dv.to(v), dg.to(g), dbeta.to(beta), dlamb.to(lamb), None, None, None, dh0_kk, dh0_kv, None, None
+        return dq, dk, dv.to(v), dg.to(g), dbeta.to(beta), dlamb.to(lamb), None, None, None, None, dh0_kk, dh0_kv, None, None
 
 
 @torch.compiler.disable
@@ -315,6 +319,7 @@ def chunk_mesa_net(
     h_kv_init: torch.Tensor | None = None,
     output_final_state: bool = False,
     max_CG_iteration: int = 30,
+    eps: float = 0.0,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
@@ -345,6 +350,11 @@ def chunk_mesa_net(
             Default: `None`.
         max_CG_iteration (int):
             Maximum number of conjugate gradient iterations for solving the linear system. Default: `30`.
+        eps (float):
+            Absolute tolerance on the L2 norm of the conjugate gradient residual: the solver exits
+            early once the residual of every row of a chunk drops below `eps`, so the tolerance is
+            relative to the scale of `q`. `0` disables early exit, i.e., the solver always runs
+            `max_CG_iteration` iterations. Default: `0.0`.
         output_final_state (Optional[bool]):
             Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
         use_qk_l2norm_in_kernel (bool):
@@ -442,6 +452,7 @@ def chunk_mesa_net(
         cu_seqlens,
         cu_seqlens_cpu,
         max_CG_iteration,
+        eps,
         h_kk_init,
         h_kv_init,
         output_final_state,
