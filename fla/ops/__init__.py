@@ -19,6 +19,7 @@ from .generalized_delta_rule import (
     fused_recurrent_dplr_delta_rule,
     fused_recurrent_iplr_delta_rule,
 )
+from .gka import gka_chebyshev_gla
 from .gla import chunk_gla, fused_chunk_gla, fused_recurrent_gla
 from .gsa import chunk_gsa, fused_recurrent_gsa
 from .hgrn import fused_recurrent_hgrn

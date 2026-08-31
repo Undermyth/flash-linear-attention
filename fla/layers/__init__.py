@@ -16,6 +16,7 @@ from .forgetting_attn import ForgettingAttention
 from .gated_deltanet import GatedDeltaNet
 from .gated_deltaproduct import GatedDeltaProduct
 from .gdn2 import GatedDeltaNet2
+from .gka import GatedKalmaNet
 from .gla import GatedLinearAttention
 from .gsa import GatedSlotAttention
 from .hgrn import HGRNAttention
