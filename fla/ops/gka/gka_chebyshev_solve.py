@@ -64,7 +64,8 @@ from fla.ops.simple_gla import (
     chunk_simple_gla,
     fused_recurrent_simple_gla,
 )
-from fla.ops.utils.op import exp
+from fla.ops.utils.constant import RCP_LN2
+from fla.ops.utils.op import exp2
 
 from .chebyshev_iteration import ChebyshevIteration
 
@@ -216,7 +217,7 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     if USE_GK:
         gk_ptr += scalar_off
         gk = tl.load(gk_ptr).to(tl.float32)
-        gk_exp = exp(gk)
+        gk_exp = exp2(gk * RCP_LN2)
     else:
         gk_exp = 1.0
 

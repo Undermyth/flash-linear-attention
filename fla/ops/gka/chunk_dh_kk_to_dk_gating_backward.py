@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from fla.ops.utils.op import exp
+from fla.ops.utils.op import exp2
 
 
 @triton.autotune(
@@ -95,7 +95,7 @@ def chunk_dh_kk_to_dk_gating_kernel(
 
     chunk_range = tl.arange(0, chunk_size)
     bool_mask = chunk_range[:, None] >= chunk_range[None, :]
-    mask = tl.where(bool_mask, exp(gkk[:, None] - gkk[None, :]), 0)
+    mask = tl.where(bool_mask, exp2(gkk[:, None] - gkk[None, :]), 0)
 
     dk = tl.zeros([chunk_size, D], dtype=tl.float32)
 
@@ -111,7 +111,7 @@ def chunk_dh_kk_to_dk_gating_kernel(
     dk += tl.dot(tl.trans(ds * mask).to(x_out.dtype), x_out)
 
     gkk_last = tl.sum(tl.where(chunk_range == chunk_size - 1, gkk, 0))
-    mask1 = exp(gkk_last - gkk)[:, None]
+    mask1 = exp2(gkk_last - gkk)[:, None]
 
     d_kk = tl.load(p_d_kk, boundary_check=(0, 1))
 
@@ -119,13 +119,13 @@ def chunk_dh_kk_to_dk_gating_kernel(
     dk = -dk
 
     kk = tl.load(p_kk, boundary_check=(0, 1))
-    dgkk += tl.sum(tl.dot(dq, kk) * tl.exp(gkk)[:, None] * x_out, axis=1)
+    dgkk += tl.sum(tl.dot(dq, kk) * exp2(gkk)[:, None] * x_out, axis=1)
 
     dk2 = tl.dot((k * mask1).to(k.dtype), d_kk.to(k.dtype))
     dgkk_last = tl.sum(dk2 * k, axis=1)
     dgkk -= dgkk_last
     dgkk_last = tl.sum(dgkk_last)
-    dgkk_last += tl.sum(d_kk * kk) * exp(gkk_last)
+    dgkk_last += tl.sum(d_kk * kk) * exp2(gkk_last)
 
     dgkk = tl.where(chunk_range < chunk_size - 1, dgkk, dgkk + dgkk_last)
 
@@ -162,7 +162,7 @@ def chunk_dh_kk_to_dk_gating(
         h_kk: Chunk-level key-key covariance with shape [B, num_chunks, H, D, D]
         d_kk: Gradient of chunk-level covariance with shape [B, num_chunks, H, D, D]
         dq: Gradient of query with shape [B, L, H, D]
-        gkk: Cumulative gating values with shape [B, L, H]
+        gkk: Cumulative gating values with shape [B, L, H], in log2 space
         chunk_size: Chunk size for parallel processing. Defaults to 64
 
     Returns:

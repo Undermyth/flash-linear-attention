@@ -5,7 +5,7 @@ import triton.language as tl
 from torch import Tensor
 
 from fla.ops.utils import chunk_local_cumsum
-from fla.ops.utils.op import exp
+from fla.ops.utils.op import exp2
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -94,7 +94,7 @@ def chunk_bwd_dk_gating_kernel(
     chunk_range = tl.arange(0, chunk_size)
     in_bounds = chunk_id * chunk_size + chunk_range < T
     bool_mask = (chunk_range[:, None] <= chunk_range[None, :]) & in_bounds[:, None] & in_bounds[None, :]
-    mask = tl.where(bool_mask, exp(gkk[None, :] - gkk[:, None]), 0)
+    mask = tl.where(bool_mask, exp2(gkk[None, :] - gkk[:, None]), 0)
     gkk_last = tl.sum(tl.where(chunk_range == tl.minimum(chunk_size - 1, T - chunk_id * chunk_size - 1), gkk, 0))
 
     s = tl.dot(k, tl.trans(x_out)) * mask
@@ -107,20 +107,20 @@ def chunk_bwd_dk_gating_kernel(
 
     d_kk = tl.load(p_d_kk, boundary_check=(0, 1))
     dk = tl.zeros([chunk_size, D], dtype=tl.float32)
-    k2 = k * exp(gkk_last - gkk)[:, None].to(k.dtype)
+    k2 = k * exp2(gkk_last - gkk)[:, None].to(k.dtype)
     dk += tl.dot(k2, (d_kk + tl.trans(d_kk)).to(k.dtype))
 
     dk += tl.dot(s.to(dq.dtype), dq)
     dk += tl.dot((ds * mask).to(x_out.dtype), x_out)
 
     h_kk = tl.load(p_h_kk, boundary_check=(0, 1))
-    dgkk += tl.sum(tl.dot(dq, h_kk) * tl.exp(gkk)[:, None] * x_out, axis=1)
+    dgkk += tl.sum(tl.dot(dq, h_kk) * exp2(gkk)[:, None] * x_out, axis=1)
 
     dk2 = tl.dot(k2, d_kk.to(k.dtype))
     dgkk_last = tl.sum(dk2 * k, axis=1)
     dgkk -= dgkk_last
     dgkk_last = tl.sum(dgkk_last)
-    dgkk_last += tl.sum(d_kk * h_kk) * exp(gkk_last)
+    dgkk_last += tl.sum(d_kk * h_kk) * exp2(gkk_last)
 
     dgkk = tl.where(chunk_range < chunk_size - 1, dgkk, dgkk + dgkk_last)
 
@@ -131,7 +131,7 @@ def chunk_bwd_dk_gating_kernel(
     w = 2 * tmp / fro
     w = tl.where(chunk_id*chunk_size + chunk_range < T, w, 0.0)
 
-    weights1 = tl.sum(mask * (exp(gkk) * w)[None, :], axis=1)
+    weights1 = tl.sum(mask * (exp2(gkk) * w)[None, :], axis=1)
     weights2 = tl.dot(mask * w[None, :], tl.trans(mask))  # * tl.trans(mask)
 
     tmp = tl.dot((tl.dot(k, tl.trans(k)) * weights2).to(k.dtype), k).to(tl.float32)
@@ -140,7 +140,7 @@ def chunk_bwd_dk_gating_kernel(
     dk += tmp
     dgkk -= tl.sum(tmp * k, axis=1) * 0.5
 
-    h_kk_suffix_sum_partial = tl.sum(exp(2 * gkk) * w) * h_kk
+    h_kk_suffix_sum_partial = tl.sum(exp2(2 * gkk) * w) * h_kk
     h_kk_suffix_sum_partial += tl.dot(tl.trans((weights1[:, None] * k).to(k.dtype)), k)
 
     p_dk = tl.make_block_ptr(
@@ -251,10 +251,10 @@ def chunk_bwd_dk_gating_kernel_forloop(
         k = tl.load(p_k, boundary_check=(0, 1))
 
         gkk_last = tl.sum(tl.where(chunk_range == tl.minimum(chunk_size - 1, T - chunk_id * chunk_size - 1), gkk, 0))
-        gkk_last_exp = exp(gkk_last)
+        gkk_last_exp = exp2(gkk_last)
 
         dk2 = -tl.dot(
-            (k * exp(gkk_last - gkk)[:, None]).to(k.dtype), h_kk_suffix_sum.to(k.dtype)
+            (k * exp2(gkk_last - gkk)[:, None]).to(k.dtype), h_kk_suffix_sum.to(k.dtype)
         )
 
         dgkk2 = tl.sum(dk2.to(tl.float32) * k, axis=1) * 0.5
@@ -308,7 +308,7 @@ def chunk_bwd_dk_gating(
         x_out: Output from forward pass with shape [B, L, H, D]
         dq: Gradient of query with shape [B, L, H, D]
         fro: Frobenius norm tensor with shape [B, L, H]
-        gkk: Cumulative gating values with shape [B, L, H]
+        gkk: Cumulative gating values with shape [B, L, H], in log2 space
         chunk_size: Chunk size for parallel processing. Defaults to 64
         ridge_ratio: Base regularization parameter. Defaults to 0.02
 

@@ -5,7 +5,8 @@ import triton.language as tl
 
 from fla.ops.common.chunk_h import chunk_bwd_dh, chunk_fwd_h
 from fla.ops.utils import chunk_local_cumsum
-from fla.ops.utils.op import exp
+from fla.ops.utils.constant import RCP_LN2
+from fla.ops.utils.op import exp2
 
 from .chunk_dh_kk_to_dk_backward import chunk_dh_kk_to_dk
 from .chunk_dh_kk_to_dk_gating_backward import chunk_dh_kk_to_dk_gating
@@ -326,7 +327,8 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     Chebyshev iteration with gating and adaptive ridge strength.
 
     Like chebyshev_iteration_fro_forward_kernel but applies exponential gating
-    (exp(gkk)) to key interactions for temporal decay. Solves (H_t + λI)·x = q
+    (exp2) to key interactions for temporal decay, consuming `gkk` in log2 space.
+    Solves (H_t + λI)·x = q
     with λ = ridge_ratio * ||H_t||_F.
 
     Grid: (num_chunks, B*H) - one thread block per chunk and batch-head pair
@@ -370,11 +372,11 @@ def chebyshev_iteration_fro_gating_forward_kernel(
 
     mask = tl.where(
         (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t[None, :]),
-        exp(gkk[:, None] - gkk[None, :]),
+        exp2(gkk[:, None] - gkk[None, :]),
         0,
     ).to(q.dtype)
 
-    exp_gkk = exp(gkk[:, None])
+    exp_gkk = exp2(gkk[:, None])
 
     if load_fro == 1:
         fro_ptr += scalar_off
@@ -478,7 +480,7 @@ def chebyshev_iteration_forward_triton(
     Args:
         k: Key tensor with shape [B, L, H, D]
         q: Query tensor with shape [B, L, H, D]
-        gkk: Cumulative gating for key-key covariance with shape [B, L, H], or None
+        gkk: Cumulative gating for key-key covariance with shape [B, L, H], in log2 space, or None
         fro: Frobenius norm tensor with shape [B, L, H] (computed if load_fro=0)
         num_iter: Number of Chebyshev iterations. Defaults to 30
         ridge_ratio: Base regularization parameter. Defaults to 0.02
@@ -577,7 +579,13 @@ class ChebyshevIteration(torch.autograd.Function):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, T, H, D = q.shape
         fro = torch.empty((B, T, H), dtype=torch.float32).to(q.device)
-        gkk = chunk_local_cumsum(gk, chunk_size=chunk_size) if gk is not None else None
+        gkk = None
+        if gk is not None:
+            gkk = chunk_local_cumsum(
+                gk,
+                chunk_size=chunk_size,
+                scale=RCP_LN2
+            )
 
         x_out, fro, _, h_kk_final = chebyshev_iteration_forward_triton(
             k,
