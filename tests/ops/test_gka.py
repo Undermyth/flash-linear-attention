@@ -5,87 +5,277 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import os
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.gka.gka_chebyshev_solve import gka_chebyshev_gla
-from fla.ops.gka.naive import naive_gka_chebyshev
-from fla.utils import assert_close, device
+from fla.ops.gka.gka_chebyshev_solve import gka_chebyshev_gla, torch_decoding_one_step
+from fla.ops.gka.naive import naive_gka_decoding_one_step, naive_gka_exact
+from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device, device_platform
+
+# MesaNet relies on CG, which converges fast enough with max_CG_iteration = D;
+# Chebyshev decays slower per iteration, so allow more rounds against the exact reference.
+NUM_ITER = 100
 
 
 @pytest.mark.parametrize(
-    ('B', 'T', 'H', 'D', 'num_iter', 'dtype'),
+    ('B', 'T', 'H', 'D', 'gate_range', 'dtype'),
     [
-        pytest.param(*test, id="B{}-T{}-H{}-D{}-iter{}-{}".format(*test))
+        pytest.param(*test, id="B{}-T{}-H{}-D{}-gate_range{}-{}".format(*test))
         for test in [
-            (1, 15, 1, 32, 1, torch.float32),
-            (1, 63, 2, 32, 5, torch.float32),
-            (2, 64, 2, 64, 10, torch.float32),
-            (2, 256, 4, 64, 1, torch.float32),
-            (2, 256, 4, 64, 5, torch.float32),
-            (2, 256, 4, 64, 30, torch.float32),
-            (2, 1024, 4, 128, 30, torch.float32),
-            (2, 1024, 4, 128, 30, torch.bfloat16),
+            (1, 63, 1, 64, [0.8, 0.99], torch.float16),
+            (2, 500, 4, 60, [0.8, 0.99], torch.float16),
+            (2, 1024, 8, 128, [0.8, 0.99], torch.float16),
+            (2, 1024, 8, 128, [0.01, 0.1], torch.float16),
+            (2, 1024, 8, 128, [1, 1], torch.float16),
+            (4, 2048, 8, 64, [0.8, 0.99], torch.float16),
         ]
     ],
 )
-@pytest.mark.parametrize(
-    ('use_g', 'use_gk'),
-    [
-        pytest.param(False, False, id="no-g-no-gk"),
-        pytest.param(True, False, id="g-no-gk"),
-        pytest.param(False, True, id="no-g-gk"),
-        pytest.param(True, True, id="g-gk"),
-    ],
+@pytest.mark.skipif(
+    device_platform == 'intel',
+    reason='Intel Triton Failure',
 )
-def test_gka_chebyshev_gla(
+def test_chunk(
     B: int,
     T: int,
     H: int,
     D: int,
+    gate_range: tuple[float, float],
+    dtype: torch.dtype,
+):
+    if D & (D - 1):
+        pytest.skip(reason='the Chebyshev kernels use make_block_ptr and require a power-of-2 D')
+    torch.manual_seed(42)
+    q = torch.rand(B, T, H, D, dtype=dtype) / 10
+    k = F.normalize(torch.rand(B, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype) / 10
+    alpha = torch.rand(B, T, H, dtype=dtype).sigmoid()
+    lower_gate, upper_gate = gate_range
+    g = torch.rand(B, T, H, dtype=dtype).float().uniform_(lower_gate, upper_gate).log()
+    gk = torch.rand(B, T, H, dtype=dtype).float().uniform_(lower_gate, upper_gate).log()
+    q, k, v, alpha, g, gk = map(lambda x: x.to(device).requires_grad_(True), (q, k, v, alpha, g, gk))
+    do = torch.rand_like(v)
+
+    scale = D ** -0.5
+    d_h_kk_final = torch.rand(B, H, D, D, dtype=torch.float32, device=device)
+    d_h_kv_final = torch.rand(B, H, D, D, dtype=torch.float32, device=device)
+
+    tri, tri_kk_final, tri_kv_final = gka_chebyshev_gla(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        alpha=alpha.clone(),
+        g=g.clone(),
+        gk=gk.clone(),
+        gla_scale=scale,
+        num_iter=NUM_ITER,
+    )
+
+    ((tri * do).sum() + (tri_kk_final * d_h_kk_final).sum() + (tri_kv_final * d_h_kv_final).sum()).backward(retain_graph=True)
+    tri_dq, tri_dk, tri_dv, tri_dalpha, tri_dg, tri_dgk = q.grad, k.grad, v.grad, alpha.grad, g.grad, gk.grad
+    q.grad = k.grad = v.grad = alpha.grad = g.grad = gk.grad = None
+
+    ref, ref_hkk_final, ref_hkv_final = naive_gka_exact(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        alpha=alpha.clone(),
+        g=g.clone(),
+        gk=gk.clone(),
+        gla_scale=scale,
+    )
+
+    ((ref * do).sum() +
+     (ref_hkk_final * d_h_kk_final).sum() + (ref_hkv_final * d_h_kv_final).sum()).backward(retain_graph=True)
+    ref_dq, ref_dk, ref_dv, ref_dalpha, ref_dg, ref_dgk = q.grad, k.grad, v.grad, alpha.grad, g.grad, gk.grad
+    q.grad = k.grad = v.grad = alpha.grad = g.grad = gk.grad = None
+
+    assert_close('o', ref, tri, 0.007)
+    assert_close('h_kk_final', ref_hkk_final, tri_kk_final, 0.008)
+    assert_close('h_kv_final', ref_hkv_final, tri_kv_final, 0.008)
+    assert_close('dq', ref_dq, tri_dq, 0.008)
+    assert_close('dk', ref_dk, tri_dk, 0.008)
+    assert_close('dv', ref_dv, tri_dv, 0.008)
+    assert_close('dalpha', ref_dalpha, tri_dalpha, 0.008)
+    assert_close('dg', ref_dg, tri_dg, 0.008)
+    assert_close('dgk', ref_dgk, tri_dgk, 0.008)
+
+
+@pytest.mark.parametrize(
+    ('H', 'D', 'gate_range', 'cu_seqlens', 'dtype'),
+    [
+        pytest.param(*test, id="H{}-D{}-gate_range{}-cu_seqlens{}-{}".format(*test))
+        for test in [
+            (3, 50, [0.8, 0.99], [0, 15], torch.float16),
+            (4, 64, [0.8, 0.99], [0, 14, 121, 421, 500], torch.float16),
+            (4, 64, [0.01, 0.1], [0, 256, 500, 1000], torch.float16),
+            (4, 100, [1, 1], [0, 15, 100, 300, 1200, 2000], torch.float16),
+        ]
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv('SKIP_TEST_CHUNK_VARLEN') == '1',
+    reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set',
+)
+def test_chunk_varlen(
+    H: int,
+    D: int,
+    gate_range: tuple[float, float],
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
+):
+    if IS_INTEL_ALCHEMIST and D > 128:
+        pytest.skip(reason='gka_chebyshev_gla is not supported on alchemist for D>128')
+    torch.manual_seed(42)
+    os.environ['TRITON_F32_DEFAULT'] = 'ieee'
+    # randomly split the sequence into N segments
+    cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.long, device=device)
+    T = cu_seqlens[-1]
+    N = len(cu_seqlens) - 1
+    # seq-first required for inputs with variable lengths
+    q = torch.randn((1, T, H, D), dtype=dtype) / 10
+    k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.randn((1, T, H, D), dtype=dtype) / 10
+    lower_gate, upper_gate = gate_range
+    g = torch.rand(1, T, H, dtype=dtype).float().uniform_(lower_gate, upper_gate).log()
+    gk = torch.rand(1, T, H, dtype=dtype).float().uniform_(lower_gate, upper_gate).log()
+    alpha = torch.rand(1, T, H, dtype=dtype).sigmoid()
+
+    q, k, v, alpha, g, gk = map(lambda x: x.to(device).requires_grad_(), (q, k, v, alpha, g, gk))
+    do = torch.rand_like(v) / 10
+
+    scale = D ** -0.5
+    d_h_kk_final = torch.rand(N, H, D, D, dtype=torch.float32, device=device)
+    d_h_kv_final = torch.rand(N, H, D, D, dtype=torch.float32, device=device)
+
+    tri, tri_h_kk_final, tri_h_kv_final = gka_chebyshev_gla(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        alpha=alpha.clone(),
+        g=g.clone(),
+        gk=gk.clone(),
+        gla_scale=scale,
+        num_iter=NUM_ITER,
+        cu_seqlens=cu_seqlens,
+    )
+
+    ((tri * do).sum() +
+     (tri_h_kk_final * d_h_kk_final).sum() + (tri_h_kv_final * d_h_kv_final).sum()).backward(retain_graph=True)
+    tri_dq, tri_dk, tri_dv, tri_dalpha, tri_dg, tri_dgk = \
+        q.grad, k.grad, v.grad, alpha.grad, g.grad, gk.grad
+    q.grad = k.grad = v.grad = alpha.grad = g.grad = gk.grad = None
+
+    ref = []
+    ref_h_kk_t = []
+    ref_h_kv_t = []
+    for i in range(N):
+        ref_i, ref_h_kk_i, ref_h_kv_i = naive_gka_exact(
+            q=q[:, cu_seqlens[i]:cu_seqlens[i+1]],
+            k=k[:, cu_seqlens[i]:cu_seqlens[i+1]],
+            v=v[:, cu_seqlens[i]:cu_seqlens[i+1]],
+            alpha=alpha[:, cu_seqlens[i]:cu_seqlens[i+1]],
+            g=g[:, cu_seqlens[i]:cu_seqlens[i+1]],
+            gk=gk[:, cu_seqlens[i]:cu_seqlens[i+1]],
+            gla_scale=scale,
+        )
+        ref.append(ref_i)
+        ref_h_kk_t.append(ref_h_kk_i)
+        ref_h_kv_t.append(ref_h_kv_i)
+    ref = torch.cat(ref, 1)
+    ref_h_kk_t = torch.cat(ref_h_kk_t, 0)
+    ref_h_kv_t = torch.cat(ref_h_kv_t, 0)
+
+    ((ref * do).sum() + (ref_h_kk_t * d_h_kk_final).sum() + (ref_h_kv_t * d_h_kv_final).sum()).backward(retain_graph=True)
+    ref_dq, ref_dk, ref_dv, ref_dalpha, ref_dg, ref_dgk = \
+        q.grad, k.grad, v.grad, alpha.grad, g.grad, gk.grad
+    q.grad = k.grad = v.grad = alpha.grad = g.grad = gk.grad = None
+
+    assert_close('o', ref, tri, 0.006)
+    assert_close('h_kk_final', ref_h_kk_t, tri_h_kk_final, 0.008)
+    assert_close('h_kv_final', ref_h_kv_t, tri_h_kv_final, 0.008)
+    assert_close('dq', ref_dq, tri_dq, 0.008)
+    assert_close('dk', ref_dk, tri_dk, 0.008)
+    assert_close('dv', ref_dv, tri_dv, 0.008)
+    assert_close('dalpha', ref_dalpha, tri_dalpha, 0.015)
+    assert_close('dg', ref_dg, tri_dg, 0.015)
+    assert_close('dgk', ref_dgk, tri_dgk, 0.015)
+
+
+@pytest.mark.parametrize(
+    ('B', 'H', 'D', 'gate_range', 'num_iter', 'dtype'),
+    [
+        pytest.param(*test, id="B{}-H{}-D{}-gate_range{}-num_iter{}-{}".format(*test))
+        for test in [
+            (1, 3, 50, [0.95, 0.99], 1, torch.float16),
+            (2, 4, 60, [0.95, 0.99], 5, torch.float16),
+            (2, 8, 128, [0.95, 0.99], 1, torch.float16),
+            (2, 8, 128, [0.95, 0.99], 5, torch.float16),
+            (2, 8, 128, [0.95, 0.99], 100, torch.float16),
+        ]
+    ],
+)
+def test_decoding_one_step(
+    B: int,
+    H: int,
+    D: int,
+    gate_range: tuple[float, float],
     num_iter: int,
     dtype: torch.dtype,
-    use_g: bool,
-    use_gk: bool,
 ):
+    if IS_INTEL_ALCHEMIST and D > 128:
+        pytest.skip(reason='gka_chebyshev_gla is not supported on alchemist for D>128')
+    if D & (D - 1):
+        pytest.skip(reason='the single-step Chebyshev kernel uses tl.arange(0, D) and requires a power-of-2 D')
     torch.manual_seed(42)
+    torch.set_default_device(device)
+    os.environ['TRITON_F32_DEFAULT'] = 'ieee'
+    # the single-step kernel reads RCP_LN2 as a python global inside @triton.jit
+    os.environ['TRITON_ALLOW_NON_CONSTEXPR_GLOBALS'] = '1'
+    q = torch.rand((B, 1, H, D), dtype=dtype)
+    k = F.normalize(torch.randn(B, 1, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.rand((B, 1, H, D), dtype=dtype)
+    lower_gate, upper_gate = gate_range
+    g = torch.rand(B, 1, H, dtype=dtype).float().uniform_(lower_gate, upper_gate).log()
+    gk = torch.rand(B, 1, H, dtype=dtype).float().uniform_(lower_gate, upper_gate).log()
+    alpha = torch.rand(B, 1, H, dtype=dtype).sigmoid()
 
-    q = torch.randn(B, T, H, D, dtype=torch.float32, device=device)
-    k = torch.randn(B, T, H, D, dtype=torch.float32, device=device)
-    v = torch.randn(B, T, H, D, dtype=torch.float32, device=device)
-    alpha = torch.randn(B, T, H, dtype=torch.float32, device=device).sigmoid()
-    g = F.logsigmoid(torch.randn(B, T, H, dtype=torch.float32, device=device)) if use_g else None
-    gk = F.logsigmoid(torch.randn(B, T, H, dtype=torch.float32, device=device)) if use_gk else None
-    scale = D ** -0.5
+    k_init_rand = F.normalize(torch.rand(B, H, D, device=device, dtype=dtype), dim=-1, p=2)
+    prev_h_kk = (k_init_rand.unsqueeze(-1) * k_init_rand.unsqueeze(-2)).detach().clone().float()
+    prev_h_kv = torch.rand(B, H, D, D, dtype=torch.float32, device=device)
 
-    # the naive reference always computes in fp32; the kernels run in `dtype`
-    ref_o, ref_hkk, ref_hkv = naive_gka_chebyshev(
-        q=q,
-        k=k,
-        v=v,
-        alpha=alpha,
-        g=g,
-        gk=gk,
-        gla_scale=scale,
+    o, curr_h_kk, curr_h_kv = torch_decoding_one_step(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        alpha=alpha.clone(),
+        g=g.clone(),
+        gk=gk.clone(),
+        gla_scale=D ** -0.5,
+        ridge_strength=0.02,
+        solver_type='chebyshev',
         num_iter=num_iter,
-    )
-    tri_o, tri_hkk, tri_hkv = gka_chebyshev_gla(
-        q=q.to(dtype),
-        k=k.to(dtype),
-        v=v.to(dtype),
-        alpha=alpha.to(dtype),
-        g=g.to(dtype) if g is not None else None,
-        gk=gk.to(dtype) if gk is not None else None,
-        gla_scale=scale,
-        num_iter=num_iter,
+        prev_h_kk=prev_h_kk.clone(),
+        prev_h_kv=prev_h_kv.clone(),
     )
 
-    ratio = 1e-2 if dtype == torch.float32 else 5e-2
-    assert_close('gla.o', ref_o, tri_o, ratio)
-    if num_iter > 0:
-        assert ref_hkk is not None and tri_hkk is not None
-        assert_close('gla.hkk', ref_hkk, tri_hkk, ratio)
-    else:
-        assert tri_hkk is None
-    assert_close('gla.hkv', ref_hkv, tri_hkv, ratio)
+    o_ref, curr_h_kk_ref, curr_h_kv_ref = naive_gka_decoding_one_step(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        alpha=alpha.clone(),
+        g=g.clone(),
+        gk=gk.clone(),
+        gla_scale=D ** -0.5,
+        ridge_strength=0.02,
+        num_iter=num_iter,
+        prev_h_kk=prev_h_kk.clone(),
+        prev_h_kv=prev_h_kv.clone(),
+    )
+
+    assert_close('o', o_ref, o, 0.005)
+    assert_close('curr_h_kk', curr_h_kk_ref, curr_h_kk, 0.005)
+    assert_close('curr_h_kv', curr_h_kv_ref, curr_h_kv, 0.005)

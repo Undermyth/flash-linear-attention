@@ -648,7 +648,10 @@ class ChebyshevIteration(torch.autograd.Function):
             v=k,
             do=x_out,
             h0=h0,
-            dht=None,
+            # The dk kernels below consume `d_kk[c]` as the negated transpose of
+            # `dL/dh_kk[c+1]` (the solve path accumulates `dq⊗x`), so the incoming
+            # final-state gradient must be injected with a flipped sign.
+            dht=-d_kk_final if d_kk_final is not None else None,
             g=gkk,
             gk=None,
             gv=None,

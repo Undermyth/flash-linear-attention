@@ -122,7 +122,7 @@ def chunk_bwd_dk_gating_kernel(
     dgkk_last = tl.sum(dgkk_last)
     dgkk_last += tl.sum(d_kk * h_kk) * exp2(gkk_last)
 
-    dgkk = tl.where(chunk_range < chunk_size - 1, dgkk, dgkk + dgkk_last)
+    dgkk = tl.where(chunk_range < tl.minimum(chunk_size - 1, T - chunk_id * chunk_size - 1), dgkk, dgkk + dgkk_last)
 
     fro = tl.load(p_fro, boundary_check=(0,)).to(tl.float32)
     tmp = ridge_ratio * tl.sum(dq * x_out, axis=1)

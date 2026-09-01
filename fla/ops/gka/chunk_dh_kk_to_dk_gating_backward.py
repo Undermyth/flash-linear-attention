@@ -110,7 +110,7 @@ def chunk_dh_kk_to_dk_gating_kernel(
     dgkk -= tl.sum(dm, axis=0)
     dk += tl.dot(tl.trans(ds * mask).to(x_out.dtype), x_out)
 
-    gkk_last = tl.sum(tl.where(chunk_range == chunk_size - 1, gkk, 0))
+    gkk_last = tl.sum(tl.where(chunk_range == tl.minimum(chunk_size - 1, T - chunk_id * chunk_size - 1), gkk, 0))
     mask1 = exp2(gkk_last - gkk)[:, None]
 
     d_kk = tl.load(p_d_kk, boundary_check=(0, 1))
@@ -127,7 +127,7 @@ def chunk_dh_kk_to_dk_gating_kernel(
     dgkk_last = tl.sum(dgkk_last)
     dgkk_last += tl.sum(d_kk * kk) * exp2(gkk_last)
 
-    dgkk = tl.where(chunk_range < chunk_size - 1, dgkk, dgkk + dgkk_last)
+    dgkk = tl.where(chunk_range < tl.minimum(chunk_size - 1, T - chunk_id * chunk_size - 1), dgkk, dgkk + dgkk_last)
 
     dgkk = tl.cumsum(-dgkk, reverse=True)
 
