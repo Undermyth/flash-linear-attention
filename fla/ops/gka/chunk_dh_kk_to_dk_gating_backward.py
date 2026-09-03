@@ -65,35 +65,25 @@ def chunk_dh_kk_to_dk_gating_kernel(
     kk_ptr += ((b_id * num_chunks + chunk_id) * H + h_id).to(tl.int64) * D * D
 
     # load
-    x_out_ptr = tl.make_block_ptr(
-        x_out_ptr,
-        (T, D),
-        (H * D, 1),
-        (chunk_id * chunk_size, 0),
-        (chunk_size, D),
-        (1, 0),
-    )
-    x_out = tl.load(x_out_ptr, boundary_check=(0, 1))  # .to(tl.float32)
-    dq_ptr = tl.make_block_ptr(
-        dq_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    dq = tl.load(dq_ptr, boundary_check=(0, 1))
-
-    p_gkk = tl.make_block_ptr(
-        gkk_ptr, (T,), (H,), (chunk_id * chunk_size,), (chunk_size,), (0,)
-    )
-
-    gkk = tl.load(p_gkk, boundary_check=(0,)).to(tl.float32)
-
-    p_d_kk = tl.make_block_ptr(d_kk_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0))
-    p_kk = tl.make_block_ptr(kk_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0))
-
-    k_ptr = tl.make_block_ptr(
-        k_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    k = tl.load(k_ptr, boundary_check=(0, 1))
-
     chunk_range = tl.arange(0, chunk_size)
+    o_t = chunk_id * chunk_size + chunk_range
+    m_t = o_t < T
+    o_d = tl.arange(0, D)
+
+    p_x_out = x_out_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    x_out = tl.load(p_x_out, mask=m_t[:, None], other=0.0)  # .to(tl.float32)
+    p_dq = dq_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    dq = tl.load(p_dq, mask=m_t[:, None], other=0.0)
+
+    p_gkk = gkk_ptr + o_t * H
+    gkk = tl.load(p_gkk, mask=m_t, other=0.0).to(tl.float32)
+
+    p_d_kk = d_kk_ptr + o_d[:, None] * D + o_d[None, :]
+    p_kk = kk_ptr + o_d[:, None] * D + o_d[None, :]
+
+    p_k = k_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    k = tl.load(p_k, mask=m_t[:, None], other=0.0)
+
     bool_mask = chunk_range[:, None] >= chunk_range[None, :]
     mask = tl.where(bool_mask, exp2(gkk[:, None] - gkk[None, :]), 0)
 
@@ -113,12 +103,12 @@ def chunk_dh_kk_to_dk_gating_kernel(
     gkk_last = tl.sum(tl.where(chunk_range == tl.minimum(chunk_size - 1, T - chunk_id * chunk_size - 1), gkk, 0))
     mask1 = exp2(gkk_last - gkk)[:, None]
 
-    d_kk = tl.load(p_d_kk, boundary_check=(0, 1))
+    d_kk = tl.load(p_d_kk)
 
     dk += tl.dot((k * mask1).to(k.dtype), (d_kk + tl.trans(d_kk)).to(k.dtype))
     dk = -dk
 
-    kk = tl.load(p_kk, boundary_check=(0, 1))
+    kk = tl.load(p_kk)
     dgkk += tl.sum(tl.dot(dq, kk) * exp2(gkk)[:, None] * x_out, axis=1)
 
     dk2 = tl.dot((k * mask1).to(k.dtype), d_kk.to(k.dtype))
@@ -131,15 +121,11 @@ def chunk_dh_kk_to_dk_gating_kernel(
 
     dgkk = tl.cumsum(-dgkk, reverse=True)
 
-    p_dgkk = tl.make_block_ptr(
-        dgkk_ptr, (T,), (H,), (chunk_id * chunk_size,), (chunk_size,), (0,)
-    )
-    tl.store(p_dgkk, dgkk.to(p_dgkk.dtype.element_ty), boundary_check=(0,))
+    p_dgkk = dgkk_ptr + o_t * H
+    tl.store(p_dgkk, dgkk.to(p_dgkk.dtype.element_ty), mask=m_t)
 
-    p_dk = tl.make_block_ptr(
-        dk_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    tl.store(p_dk, dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
+    p_dk = dk_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    tl.store(p_dk, dk.to(p_dk.dtype.element_ty), mask=m_t[:, None])
 
 
 def chunk_dh_kk_to_dk_gating(

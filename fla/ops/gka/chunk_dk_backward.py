@@ -64,34 +64,24 @@ def chunk_bwd_dk_kernel(
         ((b_id * num_chunks + chunk_id) * H + h_id).to(tl.int64) * D * D
     )
 
-    p_dq = tl.make_block_ptr(
-        dq_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    p_x_out = tl.make_block_ptr(
-        x_out_ptr,
-        (T, D),
-        (H * D, 1),
-        (chunk_id * chunk_size, 0),
-        (chunk_size, D),
-        (1, 0),
-    )
-    p_k = tl.make_block_ptr(
-        k_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    p_fro = tl.make_block_ptr(
-        fro_ptr, (T,), (H,), (chunk_id * chunk_size,), (chunk_size,), (0,)
-    )
+    o_t = chunk_id * chunk_size + tl.arange(0, chunk_size)
+    m_t = o_t < T
+    o_d = tl.arange(0, D)
 
-    p_d_kk = tl.make_block_ptr(d_kk_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0))
-    p_h_kk = tl.make_block_ptr(h_kk_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0))
+    p_dq = dq_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    p_x_out = x_out_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    p_k = k_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    p_fro = fro_ptr + o_t * H
+    p_d_kk = d_kk_ptr + o_d[:, None] * D + o_d[None, :]
+    p_h_kk = h_kk_ptr + o_d[:, None] * D + o_d[None, :]
 
-    d_kk = tl.load(p_d_kk, boundary_check=(0, 1))
-    h_kk = tl.load(p_h_kk, boundary_check=(0, 1))
+    d_kk = tl.load(p_d_kk)
+    h_kk = tl.load(p_h_kk)
 
-    k = tl.load(p_k, boundary_check=(0, 1))
-    dq = tl.load(p_dq, boundary_check=(0, 1))
-    x_out = tl.load(p_x_out, boundary_check=(0, 1))
-    fro = tl.load(p_fro, boundary_check=(0,)).to(tl.float32)
+    k = tl.load(p_k, mask=m_t[:, None], other=0.0)
+    dq = tl.load(p_dq, mask=m_t[:, None], other=0.0)
+    x_out = tl.load(p_x_out, mask=m_t[:, None], other=0.0)
+    fro = tl.load(p_fro, mask=m_t, other=0.0).to(tl.float32)
 
     weights = tl.cumsum(ridge_ratio * tl.sum(dq * x_out, axis=1) / fro, reverse=True)
     k_weight = (weights[:, None] * k).to(k.dtype)
@@ -119,19 +109,14 @@ def chunk_bwd_dk_kernel(
         tl.where(tl.arange(0, chunk_size) == 0, 1, 0) * weights
     ) * h_kk + tl.dot(tl.trans(k_weight), k)
 
-    p_dk = tl.make_block_ptr(
-        dk_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    p_h_kk_suffix_sum_partial = tl.make_block_ptr(
-        h_kk_suffix_sum_partial_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0)
-    )
+    p_dk = dk_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    p_h_kk_suffix_sum_partial = h_kk_suffix_sum_partial_ptr + o_d[:, None] * D + o_d[None, :]
 
     tl.store(
         p_h_kk_suffix_sum_partial,
         h_kk_suffix_sum_partial.to(p_h_kk_suffix_sum_partial.dtype.element_ty),
-        boundary_check=(0, 1),
     )
-    tl.store(p_dk, dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_dk, dk.to(p_dk.dtype.element_ty), mask=m_t[:, None])
 
 
 @triton.autotune(
@@ -176,56 +161,35 @@ def chunk_bwd_dk_kernel_forloop(
     dk_ptr += vec_off
     dk_final_ptr += vec_off
 
+    chunk_range = tl.arange(0, chunk_size)
+    o_d = tl.arange(0, D)
+
     h_kk_suffix_sum = tl.zeros((D, D), dtype=tl.float32)
     for chunk_id in range(num_chunks - 1, -1, -1):
         # load dq and x_out
-        p_k = tl.make_block_ptr(
-            k_ptr,
-            (T, D),
-            (H * D, 1),
-            (chunk_id * chunk_size, 0),
-            (chunk_size, D),
-            (1, 0),
-        )
-        p_dk = tl.make_block_ptr(
-            dk_ptr,
-            (T, D),
-            (H * D, 1),
-            (chunk_id * chunk_size, 0),
-            (chunk_size, D),
-            (1, 0),
-        )
-        p_h_kk_suffix_sum_partial = tl.make_block_ptr(
+        o_t = chunk_id * chunk_size + chunk_range
+        m_t = o_t < T
+        p_k = k_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+        p_dk = dk_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+        p_h_kk_suffix_sum_partial = (
             h_kk_suffix_sum_partial_ptr
-            + ((b_id * num_chunks + chunk_id) * H + h_id).to(tl.int64) * D * D,
-            (D, D),
-            (D, 1),
-            (0, 0),
-            (D, D),
-            (1, 0),
+            + ((b_id * num_chunks + chunk_id) * H + h_id).to(tl.int64) * D * D
+            + o_d[:, None] * D
+            + o_d[None, :]
         )
-        h_kk_suffix_sum_partial = tl.load(
-            p_h_kk_suffix_sum_partial, boundary_check=(0, 1)
-        )
+        h_kk_suffix_sum_partial = tl.load(p_h_kk_suffix_sum_partial)
 
-        k = tl.load(p_k, boundary_check=(0, 1))
+        k = tl.load(p_k, mask=m_t[:, None], other=0.0)
 
-        dk = tl.load(p_dk, boundary_check=(0, 1)).to(tl.float32)
+        dk = tl.load(p_dk, mask=m_t[:, None], other=0.0).to(tl.float32)
         dk += 2 * tl.dot(k, h_kk_suffix_sum.to(k.dtype))
         dk = -dk
 
         h_kk_suffix_sum += h_kk_suffix_sum_partial
 
-        p_dk_final = tl.make_block_ptr(
-            dk_final_ptr,
-            (T, D),
-            (H * D, 1),
-            (chunk_id * chunk_size, 0),
-            (chunk_size, D),
-            (1, 0),
-        )
+        p_dk_final = dk_final_ptr + o_t[:, None] * (H * D) + o_d[None, :]
 
-        tl.store(p_dk_final, dk.to(p_dk_final.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_dk_final, dk.to(p_dk_final.dtype.element_ty), mask=m_t[:, None])
 
 
 @triton.autotune(
@@ -277,10 +241,9 @@ def chunk_bwd_dk_kernel_single_pass(
     dk_ptr += vec_off
 
     h_kk_final_ptr += (b_id * H + h_id).to(tl.int64) * D * D
-    p_h_kk_final = tl.make_block_ptr(
-        h_kk_final_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0)
-    )
-    h_kk = tl.load(p_h_kk_final, boundary_check=(0, 1)).to(tl.float32)
+    o_d = tl.arange(0, D)
+    p_h_kk_final = h_kk_final_ptr + o_d[:, None] * D + o_d[None, :]
+    h_kk = tl.load(p_h_kk_final).to(tl.float32)
 
     d_kk = tl.zeros((D, D), dtype=tl.float32)
 
@@ -291,40 +254,17 @@ def chunk_bwd_dk_kernel_single_pass(
 
     for chunk_id in range(num_chunks - 1, -1, -1):
         # load dq and x_out
-        p_dq = tl.make_block_ptr(
-            dq_ptr,
-            (T, D),
-            (H * D, 1),
-            (chunk_id * chunk_size, 0),
-            (chunk_size, D),
-            (1, 0),
-        )
-        p_x_out = tl.make_block_ptr(
-            x_out_ptr,
-            (T, D),
-            (H * D, 1),
-            (chunk_id * chunk_size, 0),
-            (chunk_size, D),
-            (1, 0),
-        )
-        p_k = tl.make_block_ptr(
-            k_ptr,
-            (T, D),
-            (H * D, 1),
-            (chunk_id * chunk_size, 0),
-            (chunk_size, D),
-            (1, 0),
-        )
-        p_fro = tl.make_block_ptr(
-            fro_ptr, (T, 1), (H, 1), (chunk_id * chunk_size, 0), (chunk_size, 1), (1, 0)
-        )
+        o_t = chunk_id * chunk_size + tl.arange(0, chunk_size)
+        m_t = o_t < T
+        p_dq = dq_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+        p_x_out = x_out_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+        p_k = k_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+        p_fro = fro_ptr + o_t * H
 
-        dq = tl.load(p_dq, boundary_check=(0, 1))
-        x_out = tl.load(p_x_out, boundary_check=(0, 1))
-        k = tl.load(p_k, boundary_check=(0, 1))
-        fro = tl.reshape(
-            tl.load(p_fro, boundary_check=(0, 1)).to(tl.float32), (chunk_size,)
-        )
+        dq = tl.load(p_dq, mask=m_t[:, None], other=0.0)
+        x_out = tl.load(p_x_out, mask=m_t[:, None], other=0.0)
+        k = tl.load(p_k, mask=m_t[:, None], other=0.0)
+        fro = tl.load(p_fro, mask=m_t, other=0.0).to(tl.float32)
 
         h_kk -= tl.dot(tl.trans(k), k)
 
@@ -358,15 +298,8 @@ def chunk_bwd_dk_kernel_single_pass(
 
         d_kk += tl.dot(tl.trans(dq), x_out)
 
-        p_dk = tl.make_block_ptr(
-            dk_ptr,
-            (T, D),
-            (H * D, 1),
-            (chunk_id * chunk_size, 0),
-            (chunk_size, D),
-            (1, 0),
-        )
-        tl.store(p_dk, -dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
+        p_dk = dk_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+        tl.store(p_dk, -dk.to(p_dk.dtype.element_ty), mask=m_t[:, None])
 
 
 def chunk_bwd_dk(

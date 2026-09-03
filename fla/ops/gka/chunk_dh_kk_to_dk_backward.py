@@ -50,27 +50,20 @@ def chunk_dh_kk_to_dk_kernel(
     dh_kk_ptr += ((b_id * num_chunks + chunk_id) * H + h_id).to(tl.int64) * D * D
 
     # load
-    x_out_ptr = tl.make_block_ptr(
-        x_out_ptr,
-        (T, D),
-        (H * D, 1),
-        (chunk_id * chunk_size, 0),
-        (chunk_size, D),
-        (1, 0),
-    )
-    x_out = tl.load(x_out_ptr, boundary_check=(0, 1))
-    dq_ptr = tl.make_block_ptr(
-        dq_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    dq = tl.load(dq_ptr, boundary_check=(0, 1))
+    o_t = chunk_id * chunk_size + tl.arange(0, chunk_size)
+    m_t = o_t < T
+    o_d = tl.arange(0, D)
 
-    dh_kk_ptr = tl.make_block_ptr(dh_kk_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0))
-    dh_kk = tl.load(dh_kk_ptr, boundary_check=(0, 1))
+    p_x_out = x_out_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    x_out = tl.load(p_x_out, mask=m_t[:, None], other=0.0)
+    p_dq = dq_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    dq = tl.load(p_dq, mask=m_t[:, None], other=0.0)
 
-    k_ptr = tl.make_block_ptr(
-        k_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    k = tl.load(k_ptr, boundary_check=(0, 1))
+    p_dh_kk = dh_kk_ptr + o_d[:, None] * D + o_d[None, :]
+    dh_kk = tl.load(p_dh_kk)
+
+    p_k = k_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    k = tl.load(p_k, mask=m_t[:, None], other=0.0)
 
     mask = tl.trans(
         tl.where(
@@ -86,10 +79,8 @@ def chunk_dh_kk_to_dk_kernel(
     dk += tl.dot((tl.dot(k, tl.trans(dq)) * mask).to(x_out.dtype), x_out)
     dk = -dk
 
-    p_dk = tl.make_block_ptr(
-        dk_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    tl.store(p_dk, dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
+    p_dk = dk_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    tl.store(p_dk, dk.to(p_dk.dtype.element_ty), mask=m_t[:, None])
 
 
 def chunk_dh_kk_to_dk(

@@ -66,45 +66,26 @@ def chebyshev_iteration_forward_kernel(
 
     h_kk_ptr += ((b_id * num_chunks + chunk_id) * H + h_id).to(tl.int64) * D * D
 
-    p_q = tl.make_block_ptr(
-        q_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    p_k = tl.make_block_ptr(
-        k_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    p_h_kk = tl.make_block_ptr(h_kk_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0))
+    o_t = chunk_id * chunk_size + tl.arange(0, chunk_size)
+    m_t = o_t < T
+    o_d = tl.arange(0, D)
 
-    p_ridge_strength = tl.make_block_ptr(
-        ridge_strength_ptr,
-        (T, 1),
-        (H, 1),
-        (chunk_id * chunk_size, 0),
-        (chunk_size, 1),
-        (1, 0),
-    )
-    p_rho_sq_4 = tl.make_block_ptr(
-        rho_sq_4_ptr,
-        (T, 1),
-        (H, 1),
-        (chunk_id * chunk_size, 0),
-        (chunk_size, 1),
-        (1, 0),
-    )
-    p_stepsize = tl.make_block_ptr(
-        stepsize_ptr,
-        (T, 1),
-        (H, 1),
-        (chunk_id * chunk_size, 0),
-        (chunk_size, 1),
-        (1, 0),
-    )
+    p_q = q_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    p_k = k_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    p_h_kk = h_kk_ptr + o_d[:, None] * D + o_d[None, :]
 
-    q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
-    k = tl.load(p_k, boundary_check=(0, 1)).to(q.dtype)
-    h_kk = tl.load(p_h_kk, boundary_check=(0, 1)).to(q.dtype)
-    ridge_strength = tl.load(p_ridge_strength, boundary_check=(0, 1)).to(tl.float32)
-    rho_sq_4 = tl.load(p_rho_sq_4, boundary_check=(0, 1)).to(tl.float32)
-    stepsize = tl.load(p_stepsize, boundary_check=(0, 1)).to(tl.float32)
+    q = tl.load(p_q, mask=m_t[:, None], other=0.0).to(tl.float32)
+    k = tl.load(p_k, mask=m_t[:, None], other=0.0).to(q.dtype)
+    h_kk = tl.load(p_h_kk).to(q.dtype)
+    ridge_strength = tl.load(
+        ridge_strength_ptr + o_t[:, None] * H, mask=m_t[:, None], other=0.0
+    ).to(tl.float32)
+    rho_sq_4 = tl.load(
+        rho_sq_4_ptr + o_t[:, None] * H, mask=m_t[:, None], other=0.0
+    ).to(tl.float32)
+    stepsize = tl.load(
+        stepsize_ptr + o_t[:, None] * H, mask=m_t[:, None], other=0.0
+    ).to(tl.float32)
 
     normalizer = (
         1 / (tl.arange(1, chunk_size + 1) + chunk_id * chunk_size).to(q.dtype)
@@ -139,18 +120,11 @@ def chebyshev_iteration_forward_kernel(
 
         x = w * x - grad_and_x_prev
 
-    p_q_output = tl.make_block_ptr(
-        q_output_ptr,
-        (T, D),
-        (H * D, 1),
-        (chunk_id * chunk_size, 0),
-        (chunk_size, D),
-        (1, 0),
-    )
+    p_q_output = q_output_ptr + o_t[:, None] * (H * D) + o_d[None, :]
     tl.store(
         p_q_output,
         x.to(p_q_output.dtype.element_ty, fp_downcast_rounding="rtne"),
-        boundary_check=(0, 1),
+        mask=m_t[:, None],
     )
 
 
@@ -204,17 +178,17 @@ def chebyshev_iteration_fro_forward_kernel(
 
     h_kk_ptr += ((b_id * num_chunks + chunk_id) * H + h_id).to(tl.int64) * D * D
 
-    p_q = tl.make_block_ptr(
-        q_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    p_k = tl.make_block_ptr(
-        k_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    p_h_kk = tl.make_block_ptr(h_kk_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0))
+    o_t = chunk_id * chunk_size + tl.arange(0, chunk_size)
+    m_t = o_t < T
+    o_d = tl.arange(0, D)
 
-    q = tl.load(p_q, boundary_check=(0, 1))
-    k = tl.load(p_k, boundary_check=(0, 1))
-    h_kk = tl.load(p_h_kk, boundary_check=(0, 1))
+    p_q = q_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    p_k = k_ptr + o_t[:, None] * (H * D) + o_d[None, :]
+    p_h_kk = h_kk_ptr + o_d[:, None] * D + o_d[None, :]
+
+    q = tl.load(p_q, mask=m_t[:, None], other=0.0)
+    k = tl.load(p_k, mask=m_t[:, None], other=0.0)
+    h_kk = tl.load(p_h_kk)
 
     mask = tl.where(
         tl.arange(0, chunk_size)[:, None] >= tl.arange(0, chunk_size)[None, :], 1, 0
@@ -222,10 +196,9 @@ def chebyshev_iteration_fro_forward_kernel(
 
     if load_fro == 1:
         fro_ptr += scalar_off
-        p_fro = tl.make_block_ptr(
-            fro_ptr, (T, 1), (H, 1), (chunk_id * chunk_size, 0), (chunk_size, 1), (1, 0)
+        fro = tl.load(
+            fro_ptr + o_t[:, None] * H, mask=m_t[:, None], other=0.0
         )
-        fro = tl.load(p_fro, boundary_check=(0, 1))
     else:
         fro = tl.zeros((chunk_size, 1), dtype=tl.float32)
         h_kk_fro = tl.dot(k, tl.trans(k))  # CxC
@@ -271,29 +244,19 @@ def chebyshev_iteration_fro_forward_kernel(
         x = omega * x - grad_and_x_prev
 
     # store results
-    p_x_out = tl.make_block_ptr(
-        x_out_ptr,
-        (T, D),
-        (H * D, 1),
-        (chunk_id * chunk_size, 0),
-        (chunk_size, D),
-        (1, 0),
-    )
+    p_x_out = x_out_ptr + o_t[:, None] * (H * D) + o_d[None, :]
     tl.store(
         p_x_out,
         x.to(p_x_out.dtype.element_ty, fp_downcast_rounding="rtne"),
-        boundary_check=(0, 1),
+        mask=m_t[:, None],
     )
 
     if load_fro == 0:
         fro_ptr += scalar_off
-        p_fro = tl.make_block_ptr(
-            fro_ptr, (T, 1), (H, 1), (chunk_id * chunk_size, 0), (chunk_size, 1), (1, 0)
-        )
         tl.store(
-            p_fro,
-            fro.to(p_fro.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+            fro_ptr + o_t[:, None] * H,
+            fro.to(fro_ptr.dtype.element_ty, fp_downcast_rounding="rtne"),
+            mask=m_t[:, None],
         )
 
 
@@ -352,25 +315,17 @@ def chebyshev_iteration_fro_gating_forward_kernel(
 
     h_kk_ptr += ((b_id * num_chunks + chunk_id) * H + h_id).to(tl.int64) * D * D
 
-    p_gkk = tl.make_block_ptr(
-        gkk_ptr, (T,), (H,), (chunk_id * chunk_size,), (chunk_size,), (0,)
-    )
-    gkk = tl.load(p_gkk, boundary_check=(0,)).to(tl.float32)
-
-    p_q = tl.make_block_ptr(
-        q_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    p_k = tl.make_block_ptr(
-        k_ptr, (T, D), (H * D, 1), (chunk_id * chunk_size, 0), (chunk_size, D), (1, 0)
-    )
-    p_h_kk = tl.make_block_ptr(h_kk_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0))
-
-    q = tl.load(p_q, boundary_check=(0, 1))
-    k = tl.load(p_k, boundary_check=(0, 1))
-    h_kk = tl.load(p_h_kk, boundary_check=(0, 1))
-
     o_t = chunk_id * chunk_size + tl.arange(0, chunk_size)
     m_t = o_t < T
+    o_d = tl.arange(0, D)
+
+    gkk = tl.load(gkk_ptr + o_t * H, mask=m_t, other=0.0).to(tl.float32)
+
+    q = tl.load(q_ptr + o_t[:, None] * (H * D) + o_d[None, :],
+                mask=m_t[:, None], other=0.0)
+    k = tl.load(k_ptr + o_t[:, None] * (H * D) + o_d[None, :],
+                mask=m_t[:, None], other=0.0)
+    h_kk = tl.load(h_kk_ptr + o_d[:, None] * D + o_d[None, :])
 
     mask = tl.where(
         (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t[None, :]),
@@ -382,10 +337,9 @@ def chebyshev_iteration_fro_gating_forward_kernel(
 
     if load_fro == 1:
         fro_ptr += scalar_off
-        p_fro = tl.make_block_ptr(
-            fro_ptr, (T, 1), (H, 1), (chunk_id * chunk_size, 0), (chunk_size, 1), (1, 0)
+        fro = tl.load(
+            fro_ptr + o_t[:, None] * H, mask=m_t[:, None], other=0.0
         )
-        fro = tl.load(p_fro, boundary_check=(0, 1))
     else:
         fro = tl.zeros((chunk_size, 1), dtype=tl.float32)
         h_kk_fro = tl.dot(k, tl.trans(k))  # CxC
@@ -437,29 +391,19 @@ def chebyshev_iteration_fro_gating_forward_kernel(
 
         x = omega * x - grad_and_x_prev
     # store results
-    p_x_out = tl.make_block_ptr(
-        x_out_ptr,
-        (T, D),
-        (H * D, 1),
-        (chunk_id * chunk_size, 0),
-        (chunk_size, D),
-        (1, 0),
-    )
+    p_x_out = x_out_ptr + o_t[:, None] * (H * D) + o_d[None, :]
     tl.store(
         p_x_out,
         x.to(p_x_out.dtype.element_ty, fp_downcast_rounding="rtne"),
-        boundary_check=(0, 1),
+        mask=m_t[:, None],
     )
 
     if load_fro == 0:
         fro_ptr += scalar_off
-        p_fro = tl.make_block_ptr(
-            fro_ptr, (T, 1), (H, 1), (chunk_id * chunk_size, 0), (chunk_size, 1), (1, 0)
-        )
         tl.store(
-            p_fro,
-            fro.to(p_fro.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+            fro_ptr + o_t[:, None] * H,
+            fro.to(fro_ptr.dtype.element_ty, fp_downcast_rounding="rtne"),
+            mask=m_t[:, None],
         )
 
 

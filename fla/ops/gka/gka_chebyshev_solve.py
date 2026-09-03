@@ -209,10 +209,8 @@ def chebyshev_iteration_fro_inference_forward_kernel(
 
     prev_h_kk_ptr += (b_id * H + h_id).to(tl.int64) * D * D
 
-    p_prev_h_kk = tl.make_block_ptr(
-        prev_h_kk_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0)
-    )
-    h_kk = tl.load(p_prev_h_kk, boundary_check=(0, 1)).to(tl.float32)
+    p_prev_h_kk = prev_h_kk_ptr + range_D[:, None] * D + range_D[None, :]
+    h_kk = tl.load(p_prev_h_kk).to(tl.float32)
 
     if USE_GK:
         gk_ptr += scalar_off
@@ -257,11 +255,10 @@ def chebyshev_iteration_fro_inference_forward_kernel(
 
     h_kk_ptr += (b_id * H + h_id).to(tl.int64) * D * D
 
-    p_h_kk = tl.make_block_ptr(h_kk_ptr, (D, D), (D, 1), (0, 0), (D, D), (1, 0))
+    p_h_kk = h_kk_ptr + range_D[:, None] * D + range_D[None, :]
     tl.store(
         p_h_kk,
         h_kk_.to(p_h_kk.dtype.element_ty, fp_downcast_rounding="rtne"),
-        boundary_check=(0, 1),
     )
 
 

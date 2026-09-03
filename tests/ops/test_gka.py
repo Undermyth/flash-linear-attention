@@ -47,7 +47,7 @@ def test_chunk(
     dtype: torch.dtype,
 ):
     if D & (D - 1):
-        pytest.skip(reason='the Chebyshev kernels use make_block_ptr and require a power-of-2 D')
+        pytest.skip(reason='the Chebyshev kernels use tl.arange(0, D) and require a power-of-2 D')
     torch.manual_seed(42)
     q = torch.rand(B, T, H, D, dtype=dtype) / 10
     k = F.normalize(torch.rand(B, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
