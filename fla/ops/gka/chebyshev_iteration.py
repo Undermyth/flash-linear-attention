@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 
 from fla.ops.common.chunk_h import chunk_bwd_dh, chunk_fwd_h
-from fla.ops.utils import chunk_local_cumsum
+from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices
 from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.op import exp2
 
@@ -128,13 +128,14 @@ def chebyshev_iteration_forward_kernel(
     )
 
 
+@triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [1, 2, 4, 8]
         for num_stages in [1, 2, 3, 4]
     ],
-    key=["D"],
+    key=["D", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chebyshev_iteration_fro_forward_kernel(
@@ -145,15 +146,19 @@ def chebyshev_iteration_fro_forward_kernel(
     # output:
     x_out_ptr,
     fro_ptr,
+    cu_seqlens,
+    chunk_indices,
     # constants:
     T,
     H: tl.constexpr,
     D: tl.constexpr,
+    BD: tl.constexpr,
     chunk_size: tl.constexpr,
     # algorithm parameters:
     num_iter: tl.constexpr,
     ridge_ratio: tl.constexpr,
     load_fro: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
 ):
     """
     Chebyshev iteration with adaptive ridge strength based on Frobenius norm.
@@ -161,34 +166,49 @@ def chebyshev_iteration_fro_forward_kernel(
     Computes or loads ||H_t||_F, sets λ = ridge_ratio * ||H_t||_F, then solves
     (H_t + λI)·x = q. Optionally saves the Frobenius norm for reuse.
 
-    Grid: (num_chunks, B*H) - one thread block per chunk and batch-head pair
-    Block size: Processes [chunk_size, D] vectors per block
+    Grid: (num_chunks, B*H) - one thread block per chunk and batch-head pair.
+    For varlen inputs, dim 0 enumerates the chunks of all sequences and
+    `chunk_indices` maps each program to its sequence and in-sequence chunk.
+    Block size: Processes [chunk_size, BD] vectors per block (D zero-padded to BD)
     """
-    chunk_id, bh_id = tl.program_id(0), tl.program_id(1)
+    i_c, bh_id = tl.program_id(0), tl.program_id(1)
     b_id, h_id = bh_id // H, bh_id % H
 
-    num_chunks = tl.cdiv(T, chunk_size)
+    if IS_VARLEN:
+        i_tg = i_c.to(tl.int64)
+        i_n, i_c = (
+            tl.load(chunk_indices + i_tg * 2).to(tl.int32),
+            tl.load(chunk_indices + i_tg * 2 + 1).to(tl.int64),
+        )
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = eos - bos
+    else:
+        i_tg = (b_id * tl.cdiv(T, chunk_size) + i_c).to(tl.int64)
+        bos = (b_id * T).to(tl.int64)
 
-    scalar_off = b_id * T * H + h_id
+    scalar_off = bos * H + h_id
 
     vec_off = scalar_off * D
     q_ptr += vec_off
     x_out_ptr += vec_off
     k_ptr += vec_off
 
-    h_kk_ptr += ((b_id * num_chunks + chunk_id) * H + h_id).to(tl.int64) * D * D
+    h_kk_ptr += (i_tg * H + h_id) * D * D
 
-    o_t = chunk_id * chunk_size + tl.arange(0, chunk_size)
+    o_t = i_c * chunk_size + tl.arange(0, chunk_size)
     m_t = o_t < T
-    o_d = tl.arange(0, D)
+    o_d = tl.arange(0, BD)
+    m_d = o_d < D
+    m_tk = m_t[:, None] & m_d[None, :]
+    m_kk = m_d[:, None] & m_d[None, :]
 
     p_q = q_ptr + o_t[:, None] * (H * D) + o_d[None, :]
     p_k = k_ptr + o_t[:, None] * (H * D) + o_d[None, :]
     p_h_kk = h_kk_ptr + o_d[:, None] * D + o_d[None, :]
 
-    q = tl.load(p_q, mask=m_t[:, None], other=0.0)
-    k = tl.load(p_k, mask=m_t[:, None], other=0.0)
-    h_kk = tl.load(p_h_kk)
+    q = tl.load(p_q, mask=m_tk, other=0.0)
+    k = tl.load(p_k, mask=m_tk, other=0.0)
+    h_kk = tl.load(p_h_kk, mask=m_kk, other=0.0)
 
     mask = tl.where(
         tl.arange(0, chunk_size)[:, None] >= tl.arange(0, chunk_size)[None, :], 1, 0
@@ -248,7 +268,7 @@ def chebyshev_iteration_fro_forward_kernel(
     tl.store(
         p_x_out,
         x.to(p_x_out.dtype.element_ty, fp_downcast_rounding="rtne"),
-        mask=m_t[:, None],
+        mask=m_tk,
     )
 
     if load_fro == 0:
@@ -260,13 +280,14 @@ def chebyshev_iteration_fro_forward_kernel(
         )
 
 
+@triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [1, 2, 4, 8]
         for num_stages in [1, 2, 3, 4]
     ],
-    key=["D"],
+    key=["D", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chebyshev_iteration_fro_gating_forward_kernel(
@@ -278,15 +299,19 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     # output:
     x_out_ptr,
     fro_ptr,
+    cu_seqlens,
+    chunk_indices,
     # constants:
     T,
     H: tl.constexpr,
     D: tl.constexpr,
+    BD: tl.constexpr,
     chunk_size: tl.constexpr,
     # algorithm parameters:
     num_iter: tl.constexpr,
     ridge_ratio: tl.constexpr,
     load_fro: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
 ):
     """
     Chebyshev iteration with gating and adaptive ridge strength.
@@ -296,16 +321,27 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     Solves (H_t + λI)·x = q
     with λ = ridge_ratio * ||H_t||_F.
 
-    Grid: (num_chunks, B*H) - one thread block per chunk and batch-head pair
-    Block size: Processes [chunk_size, D] vectors per block
+    Grid: (num_chunks, B*H) - one thread block per chunk and batch-head pair.
+    For varlen inputs, dim 0 enumerates the chunks of all sequences and
+    `chunk_indices` maps each program to its sequence and in-sequence chunk.
+    Block size: Processes [chunk_size, BD] vectors per block (D zero-padded to BD)
     """
-    # h_kk: [b, nc, h, d, d], kqx: [b, t, h, d]
-    chunk_id, bh_id = tl.program_id(0), tl.program_id(1)
+    i_c, bh_id = tl.program_id(0), tl.program_id(1)
     b_id, h_id = bh_id // H, bh_id % H
 
-    num_chunks = tl.cdiv(T, chunk_size)
+    if IS_VARLEN:
+        i_tg = i_c.to(tl.int64)
+        i_n, i_c = (
+            tl.load(chunk_indices + i_tg * 2).to(tl.int32),
+            tl.load(chunk_indices + i_tg * 2 + 1).to(tl.int64),
+        )
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = eos - bos
+    else:
+        i_tg = (b_id * tl.cdiv(T, chunk_size) + i_c).to(tl.int64)
+        bos = (b_id * T).to(tl.int64)
 
-    scalar_off = b_id * T * H + h_id
+    scalar_off = bos * H + h_id
     gkk_ptr += scalar_off
 
     vec_off = scalar_off * D
@@ -313,19 +349,22 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     x_out_ptr += vec_off
     k_ptr += vec_off
 
-    h_kk_ptr += ((b_id * num_chunks + chunk_id) * H + h_id).to(tl.int64) * D * D
+    h_kk_ptr += (i_tg * H + h_id) * D * D
 
-    o_t = chunk_id * chunk_size + tl.arange(0, chunk_size)
+    o_t = i_c * chunk_size + tl.arange(0, chunk_size)
     m_t = o_t < T
-    o_d = tl.arange(0, D)
+    o_d = tl.arange(0, BD)
+    m_d = o_d < D
+    m_tk = m_t[:, None] & m_d[None, :]
+    m_kk = m_d[:, None] & m_d[None, :]
 
     gkk = tl.load(gkk_ptr + o_t * H, mask=m_t, other=0.0).to(tl.float32)
 
     q = tl.load(q_ptr + o_t[:, None] * (H * D) + o_d[None, :],
-                mask=m_t[:, None], other=0.0)
+                mask=m_tk, other=0.0)
     k = tl.load(k_ptr + o_t[:, None] * (H * D) + o_d[None, :],
-                mask=m_t[:, None], other=0.0)
-    h_kk = tl.load(h_kk_ptr + o_d[:, None] * D + o_d[None, :])
+                mask=m_tk, other=0.0)
+    h_kk = tl.load(h_kk_ptr + o_d[:, None] * D + o_d[None, :], mask=m_kk, other=0.0)
 
     mask = tl.where(
         (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t[None, :]),
@@ -395,7 +434,7 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     tl.store(
         p_x_out,
         x.to(p_x_out.dtype.element_ty, fp_downcast_rounding="rtne"),
-        mask=m_t[:, None],
+        mask=m_tk,
     )
 
     if load_fro == 0:
@@ -418,6 +457,8 @@ def chebyshev_iteration_forward_triton(
     load_fro: int = 0,
     output_final_state: bool = False,
     h0=None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Solves (H_t + λI)·x = q using Chebyshev iteration with chunked processing.
@@ -435,12 +476,15 @@ def chebyshev_iteration_forward_triton(
         chunk_size: Chunk size for parallel processing. Defaults to 64
         load_fro: Whether to load (1) or compute (0) Frobenius norm. Defaults to 0
         output_final_state: Whether to return final h_kk state. Defaults to False
+        cu_seqlens: Cumulative sequence lengths with shape [N+1] for varlen inputs, or None
+        chunk_indices: Chunk indices prepared from cu_seqlens, computed if None
 
     Returns:
         x_out: Solution tensor with shape [B, L, H, D]
         fro: Frobenius norm tensor with shape [B, L, H]
         h_kk: Chunk-level key-key covariance with shape [B, num_chunks, H, D, D]
-        h_kk_final: Final state with shape [B, H, D, D], or None if output_final_state=False
+            (num_chunks counts the chunks of all sequences for varlen inputs)
+        h_kk_final: Final state with shape [N, H, D, D], or None if output_final_state=False
     """
     h_kk, h_kk_final = chunk_fwd_h(
         k=k,
@@ -451,55 +495,66 @@ def chebyshev_iteration_forward_triton(
         h0=h0,  # initial_state
         output_final_state=output_final_state,
         states_in_fp32=False,
-        cu_seqlens=None,
+        cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
     )
 
     B, T, H, D = q.shape
 
-    num_chunks = triton.cdiv(T, chunk_size)
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    num_chunks = triton.cdiv(T, chunk_size) if cu_seqlens is None else len(chunk_indices)
     grid = (num_chunks, H * B)
+    # the D x D state tiles are zero-padded to the next power of 2 so that
+    # non-power-of-2 head dims can use tl.arange(0, BD)
+    BD = triton.next_power_of_2(D)
 
     x_out = torch.empty_like(q)
 
     if gkk is None:
         chebyshev_iteration_fro_forward_kernel[grid](
             # inputs:
-            h_kk,
-            k,
-            q,
+            h_kk_ptr=h_kk,
+            k_ptr=k,
+            q_ptr=q,
             # output:
-            x_out,
-            fro,  # omega_last,
+            x_out_ptr=x_out,
+            fro_ptr=fro,  # omega_last,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
             # constants:
-            T,
-            H,
-            D,
-            chunk_size,
+            T=T,
+            H=H,
+            D=D,
+            BD=BD,
+            chunk_size=chunk_size,
             # algorithm parameters:
-            num_iter,
-            ridge_ratio,
-            load_fro,
+            num_iter=num_iter,
+            ridge_ratio=ridge_ratio,
+            load_fro=load_fro,
         )
     else:
         chebyshev_iteration_fro_gating_forward_kernel[grid](
             # inputs:
-            h_kk,
-            k,
-            q,
-            gkk,
+            h_kk_ptr=h_kk,
+            k_ptr=k,
+            q_ptr=q,
+            gkk_ptr=gkk,
             # output:
-            x_out,
-            fro,  # omega_last,
+            x_out_ptr=x_out,
+            fro_ptr=fro,  # omega_last,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
             # constants:
-            T,
-            H,
-            D,
-            chunk_size,
+            T=T,
+            H=H,
+            D=D,
+            BD=BD,
+            chunk_size=chunk_size,
             # algorithm parameters:
-            num_iter,
-            ridge_ratio,
-            load_fro,
+            num_iter=num_iter,
+            ridge_ratio=ridge_ratio,
+            load_fro=load_fro,
         )
 
     return x_out, fro, h_kk, h_kk_final
@@ -511,6 +566,7 @@ class ChebyshevIteration(torch.autograd.Function):
 
     The forward pass solves the ridge regression problem and computes final key-key state.
     The backward pass reuses the forward solver on gradients for efficient backpropagation.
+    Supports packed variable-length inputs via `cu_seqlens`.
     """
 
     @staticmethod
@@ -524,15 +580,26 @@ class ChebyshevIteration(torch.autograd.Function):
         bp_lambda: bool = True,
         h0=None,
         chunk_size: int = 64,
+        cu_seqlens: torch.LongTensor | None = None,
+        cu_seqlens_cpu: torch.LongTensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, T, H, D = q.shape
         fro = torch.empty((B, T, H), dtype=torch.float32).to(q.device)
+        chunk_indices = None
+        if cu_seqlens is not None:
+            chunk_indices = prepare_chunk_indices(
+                cu_seqlens,
+                chunk_size,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+            )
         gkk = None
         if gk is not None:
             gkk = chunk_local_cumsum(
                 gk,
                 chunk_size=chunk_size,
-                scale=RCP_LN2
+                scale=RCP_LN2,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
             )
 
         x_out, fro, _, h_kk_final = chebyshev_iteration_forward_triton(
@@ -546,13 +613,16 @@ class ChebyshevIteration(torch.autograd.Function):
             load_fro=0,
             output_final_state=True,
             h0=h0,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
         )
 
-        ctx.save_for_backward(k, x_out, fro, gkk, h0)
+        ctx.save_for_backward(k, x_out, fro, gkk, h0, chunk_indices)
         ctx.num_iter = num_iter
         ctx.chunk_size = chunk_size
         ctx.ridge_ratio = ridge_ratio
         ctx.bp_lambda = bp_lambda
+        ctx.cu_seqlens = cu_seqlens
 
         return x_out, h_kk_final
 
@@ -568,12 +638,15 @@ class ChebyshevIteration(torch.autograd.Function):
         None,
         torch.Tensor | None,
         None,
+        None,
+        None,
     ]:
-        k, x_out, fro, gkk, h0 = ctx.saved_tensors
+        k, x_out, fro, gkk, h0, chunk_indices = ctx.saved_tensors
         num_iter = ctx.num_iter
         ridge_ratio = ctx.ridge_ratio
         chunk_size = ctx.chunk_size
         bp_lambda = ctx.bp_lambda
+        cu_seqlens = ctx.cu_seqlens
 
         dq, fro, h_kk, _ = chebyshev_iteration_forward_triton(
             k,
@@ -585,7 +658,9 @@ class ChebyshevIteration(torch.autograd.Function):
             chunk_size=chunk_size,
             load_fro=1,
             output_final_state=False,
-            h0=h0
+            h0=h0,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
         )
 
         h_kk_final = None
@@ -605,6 +680,7 @@ class ChebyshevIteration(torch.autograd.Function):
             gv=None,
             chunk_size=chunk_size,
             scale=1,
+            cu_seqlens=cu_seqlens,
         )
 
         if gkk is None:
@@ -619,9 +695,14 @@ class ChebyshevIteration(torch.autograd.Function):
                     h_kk_final,
                     chunk_size=chunk_size,
                     ridge_ratio=ridge_ratio,
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
                 )
             else:
-                dk = chunk_dh_kk_to_dk(k, x_out, d_kk, dq, ctx.chunk_size)
+                dk = chunk_dh_kk_to_dk(
+                    k, x_out, d_kk, dq, ctx.chunk_size,
+                    cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+                )
 
             dgk = None
         else:  # use gating
@@ -636,10 +717,13 @@ class ChebyshevIteration(torch.autograd.Function):
                     gkk,
                     chunk_size=chunk_size,
                     ridge_ratio=ridge_ratio,
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
                 )
             else:
                 dk, dgk = chunk_dh_kk_to_dk_gating(
-                    k, x_out, h_kk, d_kk, dq, gkk, ctx.chunk_size
+                    k, x_out, h_kk, d_kk, dq, gkk, ctx.chunk_size,
+                    cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
                 )
 
-        return dk, dq, dgk, None, None, None, dh0, None
+        return dk, dq, dgk, None, None, None, dh0, None, None, None

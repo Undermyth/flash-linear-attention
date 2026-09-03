@@ -53,7 +53,7 @@ import torch.nn as nn
 from einops import rearrange, repeat
 from torch.nn import functional as F
 
-from fla.layers.utils import get_layer_cache, update_layer_cache
+from fla.layers.utils import get_layer_cache, repad_hidden_states, unpad_hidden_states, update_layer_cache
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 
 if TYPE_CHECKING:
@@ -414,7 +414,8 @@ class GatedKalmaNet(nn.Module):
 
         Args:
             hidden_states: Input tensor with shape [B, L/SP, Dh].
-            attention_mask: Optional 0-1 mask. Not used.
+            attention_mask: Optional 0-1 mask of shape [B, L] used to unpad padded
+                inputs into a packed sequence (see `unpad_hidden_states`).
             past_key_values: Optional cache containing conv_state and recurrent_state
                 for inference. When provided, performs incremental decoding.
             use_cache: Whether to return updated cache states. Defaults to False.
@@ -427,10 +428,13 @@ class GatedKalmaNet(nn.Module):
                 - attention_weights: None (not computed for GKA)
                 - past_key_values: Updated cache (same as input if provided, else None)
         """
-        # During inference, if attention_mask is not None, throw an error
-        if attention_mask is not None and not self.training:
-            raise NotImplementedError(
-                "GKA kernels currently do not support varlen inputs."
+        # During inference with padding, the mask must be a 0-1 matrix; it is
+        # converted to `cu_seqlens` so the varlen kernels can consume it packed.
+        if attention_mask is not None:
+            assert len(attention_mask.shape) == 2, (
+                "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
+                "for padding purposes (0 indicating padding). "
+                "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
             )
 
         batch_size, q_len, _ = hidden_states.shape
@@ -438,6 +442,9 @@ class GatedKalmaNet(nn.Module):
         last_state = get_layer_cache(self, past_key_values)
 
         cu_seqlens = kwargs.get("cu_seqlens")
+        hidden_states, indices, cu_seqlens = unpad_hidden_states(
+            hidden_states, cu_seqlens, attention_mask, q_len
+        )
 
         # Apply projections and convolutions
         conv_state_q, conv_state_k, conv_state_v = None, None, None
@@ -524,8 +531,9 @@ class GatedKalmaNet(nn.Module):
 
         gk = g if self.use_forgetting_gate_kk else None
 
-        # Backward kernels require sequence length to be divisible by chunk size
-        if gk is None and self.training:
+        # Backward kernels require sequence length to be divisible by chunk size;
+        # the varlen kernels instead mask the ragged chunk tails.
+        if gk is None and self.training and cu_seqlens is None:
             seq_len = hidden_states.shape[1]
             assert (
                 seq_len % self.chunk_size == 0
@@ -547,11 +555,16 @@ class GatedKalmaNet(nn.Module):
                     num_iter=self.num_iter,
                     bp_lambda=self.bp_lambda,
                     chunk_size=self.chunk_size,
+                    cu_seqlens=cu_seqlens,
                 )
                 # o: [B_sp, Lp, H, D]
-                # h_kk: [B_sp, H, D, D]
-                # h_kv: [B_sp, H, D, D]
+                # h_kk: [N, H, D, D] (N = B, or the number of packed sequences)
+                # h_kv: [N, H, D, D]
         else:
+            if cu_seqlens is not None:
+                raise NotImplementedError(
+                    "GKA single-step decoding does not support `cu_seqlens` yet."
+                )
             with torch.cuda.device(q.device):
                 o, h_kk, h_kv = torch_decoding_one_step(
                     q=q.squeeze(0),
@@ -596,5 +609,6 @@ class GatedKalmaNet(nn.Module):
         # Reshape and project output
         o = rearrange(o, "b t h d -> b t (h d)")  # [B_sp, Lp, Dexp]
         o = self.o_proj(o)  # [B_sp, Lp, Dh]
+        o = repad_hidden_states(o, indices, batch_size, q_len)  # [B, L, Dh]
 
         return o, None, past_key_values

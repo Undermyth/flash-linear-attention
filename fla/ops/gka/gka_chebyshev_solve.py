@@ -72,7 +72,7 @@ from .chebyshev_iteration import ChebyshevIteration
 
 @torch.compiler.disable
 def latent_chebyshev(
-    k, q, ridge_strength, num_iter, solver_type, bp_lambda, gk, chunk_size
+    k, q, ridge_strength, num_iter, solver_type, bp_lambda, gk, chunk_size, cu_seqlens, cu_seqlens_cpu
 ):
     """
     Dispatcher for ridge regression solvers: (H_t + λI)·x_t = q_t.
@@ -88,14 +88,17 @@ def latent_chebyshev(
         solver_type: Solver method. Currently only supports 'chebyshev'.
         bp_lambda: Whether to backprop through λ (for Chebyshev solvers)
         gk: Forgetting gate for key-key covariance with shape [B, L, H]
+        cu_seqlens: Cumulative sequence lengths with shape [N+1] for varlen inputs, or None
+        cu_seqlens_cpu: Optional host copy of cu_seqlens
 
     Returns:
         x: Solution tensor with shape [B, L, H, D]
-        kk_final: Final key-key covariance H_T with shape [B, H, D, D]
+        kk_final: Final key-key covariance H_T with shape [N, H, D, D]
     """
     if solver_type == "chebyshev":
         x, kk_final = ChebyshevIteration.apply(
-            k, q, gk, num_iter, ridge_strength, bp_lambda, None, chunk_size
+            k, q, gk, num_iter, ridge_strength, bp_lambda, None, chunk_size,
+            cu_seqlens, cu_seqlens_cpu,
         )
     else:
         raise ValueError(f"Unknown GKA solver type: {solver_type}")
@@ -116,6 +119,8 @@ def gka_chebyshev_gla(
     num_iter: int = 30,
     bp_lambda: bool = True,
     chunk_size: int = 64,
+    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     GKA Chebyshev solver for parallel training.
@@ -135,21 +140,33 @@ def gka_chebyshev_gla(
         solver_type: Solver method. Currently only supports 'chebyshev' (Triton). Defaults to 'chebyshev'.
         num_iter: Iterations for iterative solvers. Set to 0 to skip ridge regression. Defaults to 30.
         bp_lambda: Whether to backprop through λ. Default True
+        chunk_size: Chunk size for parallel processing. Defaults to 64
+        cu_seqlens: Cumulative sequence lengths with shape [N+1] used for variable-length
+            training, consistent with the FlashAttention API. `B` is expected to be 1 then.
+        cu_seqlens_cpu: CPU copy of `cu_seqlens` to avoid unnecessary device synchronization.
+            Defaults to None.
 
     Returns:
         o: Output tensor with shape [B, L, H, D]
         kk_final: Final key-key covariance (H_T in the regression problem) with shape
-            [B, H, D, D], or None if num_iter=0.
-        kv_final: Final key-value state from GLA with shape [B, H, D, D]
+            [N, H, D, D], or None if num_iter=0.
+        kv_final: Final key-value state from GLA with shape [N, H, D, D]
 
     Notes:
         For single-step autoregressive inference, use torch_decoding_one_step instead.
     """
 
+    if cu_seqlens is not None and q.shape[0] != 1:
+        raise ValueError(
+            f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`. "
+            f"Please flatten variable-length inputs before processing.",
+        )
+
     if num_iter > 0:
         # q_ solves (H_t + λI) · q_ = q_t
         q_, kk_final = latent_chebyshev(
-            k, q, ridge_strength, num_iter, solver_type, bp_lambda, gk, chunk_size
+            k, q, ridge_strength, num_iter, solver_type, bp_lambda, gk, chunk_size,
+            cu_seqlens, cu_seqlens_cpu,
         )
 
         q = q + alpha[..., None] * (q_ - q)  # Equivalent to ⍺q_ + (1-⍺)q
@@ -157,7 +174,8 @@ def gka_chebyshev_gla(
         kk_final = None
 
     o, kv_final = chunk_simple_gla(
-        q=q, k=k, v=v, scale=gla_scale, g=g, output_final_state=True
+        q=q, k=k, v=v, scale=gla_scale, g=g, output_final_state=True,
+        cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
     )
 
     return o, kk_final, kv_final

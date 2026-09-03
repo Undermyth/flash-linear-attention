@@ -17,7 +17,7 @@ from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device, device_platform
 
 # MesaNet relies on CG, which converges fast enough with max_CG_iteration = D;
 # Chebyshev decays slower per iteration, so allow more rounds against the exact reference.
-NUM_ITER = 100
+NUM_ITER = 30
 
 
 @pytest.mark.parametrize(
