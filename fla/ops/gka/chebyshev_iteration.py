@@ -234,8 +234,10 @@ def chebyshev_iteration_fro_forward_kernel(
             axis=1,
             keep_dims=True,
         )
+        # h_kk grows with the accumulated history, so both the elementwise square and the
+        # reduction have to leave fp16 to avoid inf in `fro`
         fro = tl.sqrt(
-            tl.sum(h_kk * h_kk)
+            tl.sum(h_kk.to(tl.float32) * h_kk.to(tl.float32))
             + 2 * tl.cumsum(tl.sum(k * tl.dot(k.to(h_kk.dtype), h_kk), axis=1))[:, None]
             + fro
         )
@@ -393,7 +395,9 @@ def chebyshev_iteration_fro_gating_forward_kernel(
             keep_dims=True,
         )
 
-        fro += exp_gkk * (exp_gkk * tl.sum(h_kk * h_kk))
+        # h_kk grows with the accumulated history, so both the elementwise square and the
+        # reduction have to leave fp16 to avoid inf in `fro`
+        fro += exp_gkk * (exp_gkk * tl.sum(h_kk.to(tl.float32) * h_kk.to(tl.float32)))
         fro = tl.sqrt(
             fro
             + 2
