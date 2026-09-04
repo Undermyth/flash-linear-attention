@@ -279,3 +279,94 @@ def test_decoding_one_step(
     assert_close('o', o_ref, o, 0.005)
     assert_close('curr_h_kk', curr_h_kk_ref, curr_h_kk, 0.005)
     assert_close('curr_h_kv', curr_h_kv_ref, curr_h_kv, 0.005)
+
+
+@pytest.mark.parametrize(
+    ('N', 'H', 'D', 'gate_range', 'num_iter', 'dtype'),
+    [
+        pytest.param(*test, id="N{}-H{}-D{}-gate_range{}-num_iter{}-{}".format(*test))
+        for test in [
+            (1, 3, 64, [0.95, 0.99], 5, torch.float16),
+            (3, 4, 64, [0.95, 0.99], 1, torch.float16),
+            (5, 2, 64, [0.8, 0.99], 5, torch.float16),
+            (8, 8, 128, [0.95, 0.99], 100, torch.float16),
+        ]
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv('SKIP_TEST_CHUNK_VARLEN') == '1',
+    reason='Skipping test_decoding_one_step_varlen because SKIP_TEST_CHUNK_VARLEN is set',
+)
+def test_decoding_one_step_varlen(
+    N: int,
+    H: int,
+    D: int,
+    gate_range: tuple[float, float],
+    num_iter: int,
+    dtype: torch.dtype,
+):
+    if IS_INTEL_ALCHEMIST and D > 128:
+        pytest.skip(reason='gka_chebyshev_gla is not supported on alchemist for D>128')
+    if D & (D - 1):
+        pytest.skip(reason='the single-step Chebyshev kernel uses tl.arange(0, D) and requires a power-of-2 D')
+    torch.manual_seed(42)
+    torch.set_default_device(device)
+    os.environ['TRITON_F32_DEFAULT'] = 'ieee'
+    # the single-step kernel reads RCP_LN2 as a python global inside @triton.jit
+    os.environ['TRITON_ALLOW_NON_CONSTEXPR_GLOBALS'] = '1'
+    # a decoding step consumes one token per sequence, so N packed tokens make N sequences
+    q = torch.rand((1, N, H, D), dtype=dtype)
+    k = F.normalize(torch.randn(1, N, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.rand((1, N, H, D), dtype=dtype)
+    lower_gate, upper_gate = gate_range
+    g = torch.rand(1, N, H, dtype=dtype).float().uniform_(lower_gate, upper_gate).log()
+    gk = torch.rand(1, N, H, dtype=dtype).float().uniform_(lower_gate, upper_gate).log()
+    alpha = torch.rand(1, N, H, dtype=dtype).sigmoid()
+    cu_seqlens = torch.arange(N + 1, dtype=torch.long, device=device)
+
+    k_init_rand = F.normalize(torch.rand(N, H, D, device=device, dtype=dtype), dim=-1, p=2)
+    prev_h_kk = (k_init_rand.unsqueeze(-1) * k_init_rand.unsqueeze(-2)).detach().clone().float()
+    prev_h_kv = torch.rand(N, H, D, D, dtype=torch.float32, device=device)
+
+    o, curr_h_kk, curr_h_kv = torch_decoding_one_step(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        alpha=alpha.clone(),
+        g=g.clone(),
+        gk=gk.clone(),
+        gla_scale=D ** -0.5,
+        ridge_strength=0.02,
+        solver_type='chebyshev',
+        num_iter=num_iter,
+        prev_h_kk=prev_h_kk.clone(),
+        prev_h_kv=prev_h_kv.clone(),
+        cu_seqlens=cu_seqlens,
+    )
+
+    # decode every sequence on its own as the reference
+    ref, ref_h_kk_t, ref_h_kv_t = [], [], []
+    for i in range(N):
+        ref_i, ref_h_kk_i, ref_h_kv_i = naive_gka_decoding_one_step(
+            q=q[:, i:i + 1],
+            k=k[:, i:i + 1],
+            v=v[:, i:i + 1],
+            alpha=alpha[:, i:i + 1],
+            g=g[:, i:i + 1],
+            gk=gk[:, i:i + 1],
+            gla_scale=D ** -0.5,
+            ridge_strength=0.02,
+            num_iter=num_iter,
+            prev_h_kk=prev_h_kk[i:i + 1],
+            prev_h_kv=prev_h_kv[i:i + 1],
+        )
+        ref.append(ref_i)
+        ref_h_kk_t.append(ref_h_kk_i)
+        ref_h_kv_t.append(ref_h_kv_i)
+    ref = torch.cat(ref, 1)
+    ref_h_kk_t = torch.cat(ref_h_kk_t, 0)
+    ref_h_kv_t = torch.cat(ref_h_kv_t, 0)
+
+    assert_close('o', ref, o, 0.005)
+    assert_close('curr_h_kk', ref_h_kk_t, curr_h_kk, 0.005)
+    assert_close('curr_h_kv', ref_h_kv_t, curr_h_kv, 0.005)

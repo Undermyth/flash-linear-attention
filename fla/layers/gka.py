@@ -561,10 +561,6 @@ class GatedKalmaNet(nn.Module):
                 # h_kk: [N, H, D, D] (N = B, or the number of packed sequences)
                 # h_kv: [N, H, D, D]
         else:
-            if cu_seqlens is not None:
-                raise NotImplementedError(
-                    "GKA single-step decoding does not support `cu_seqlens` yet."
-                )
             with torch.cuda.device(q.device):
                 o, h_kk, h_kv = torch_decoding_one_step(
                     q=q.squeeze(0),
@@ -579,10 +575,11 @@ class GatedKalmaNet(nn.Module):
                     num_iter=self.num_iter,
                     prev_h_kk=last_h_kk,
                     prev_h_kv=last_h_kv,
+                    cu_seqlens=cu_seqlens,
                 )
-                # o: [Lp, H, D] (batch squeezed)
-                # h_kk: [H, D, D]
-                # h_kv: [H, D, D]
+                # o: [B_sp, Lp, H, D] ([1, N, H, D] when the inputs are packed)
+                # h_kk: [N, H, D, D] (N = B, or the number of packed sequences)
+                # h_kv: [N, H, D, D]
             if len(o.shape) == 3:
                 o = o.unsqueeze(0)  # [1, Lp, H, D]
 

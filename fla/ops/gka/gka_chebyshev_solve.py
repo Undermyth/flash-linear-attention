@@ -51,6 +51,7 @@ Shape Notation:
     We use the following variables for shape hints:
         B: Batch size
         L: Sequence length
+        N: Number of packed sequences for varlen inputs
         H: Number of attention heads
         D: Head dimension
 """
@@ -181,7 +182,10 @@ def gka_chebyshev_gla(
     return o, kk_final, kv_final
 
 
-@triton.heuristics({"USE_GK": lambda args: args["gk_ptr"] is not None})
+@triton.heuristics({
+    "USE_GK": lambda args: args["gk_ptr"] is not None,
+    "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+})
 @triton.jit(do_not_specialize=["T"])
 def chebyshev_iteration_fro_inference_forward_kernel(
     # inputs:
@@ -192,6 +196,7 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     # output:
     x_out_ptr,
     h_kk_ptr,
+    cu_seqlens,
     # constants:
     T,
     H: tl.constexpr,
@@ -200,6 +205,7 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     num_iter: tl.constexpr,
     ridge_ratio: tl.constexpr,
     USE_GK: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
 ):
     """
     Triton kernel for single-step Chebyshev iteration during inference.
@@ -208,12 +214,20 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     (h_kk + λI)·x = q using Chebyshev iteration. Optimized for autoregressive
     decoding where one token is processed at a time.
 
-    Grid: (B, H) - one thread block per batch element and head
+    Grid: (B, H) - one thread block per batch element and head.
+    For varlen inputs, dim 0 enumerates the `N` packed sequences, each holding a
+    single token located through `cu_seqlens`, while the states stay indexed by
+    the sequence id.
     Block size: Processes full D-dimensional vectors per block
     """
-    b_id, h_id = tl.program_id(0), tl.program_id(1)
+    i_n, h_id = tl.program_id(0), tl.program_id(1)
 
-    scalar_off = b_id * T * H + h_id
+    if IS_VARLEN:
+        i_t = tl.load(cu_seqlens + i_n).to(tl.int64)
+    else:
+        i_t = i_n.to(tl.int64) * T
+
+    scalar_off = i_t * H + h_id
 
     range_D = tl.arange(0, D)
 
@@ -225,7 +239,7 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     q = tl.load(q_ptr)
     k = tl.load(k_ptr)
 
-    prev_h_kk_ptr += (b_id * H + h_id).to(tl.int64) * D * D
+    prev_h_kk_ptr += (i_n * H + h_id).to(tl.int64) * D * D
 
     p_prev_h_kk = prev_h_kk_ptr + range_D[:, None] * D + range_D[None, :]
     h_kk = tl.load(p_prev_h_kk).to(tl.float32)
@@ -271,7 +285,7 @@ def chebyshev_iteration_fro_inference_forward_kernel(
 
     tl.store(x_out_ptr, x.to(x_out_ptr.dtype.element_ty))
 
-    h_kk_ptr += (b_id * H + h_id).to(tl.int64) * D * D
+    h_kk_ptr += (i_n * H + h_id).to(tl.int64) * D * D
 
     p_h_kk = h_kk_ptr + range_D[:, None] * D + range_D[None, :]
     tl.store(
@@ -287,6 +301,7 @@ def chebyshev_iteration_forward_triton_inference(
     gk: torch.Tensor,
     num_iter: int = 30,
     ridge_ratio: float = 0.1,
+    cu_seqlens: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Solves (h_kk + λI)·x = q for single-step inference using Triton-optimized Chebyshev iteration.
@@ -301,16 +316,19 @@ def chebyshev_iteration_forward_triton_inference(
         gk: Forgetting gate for key-key covariance with shape [B, 1, H]
         num_iter: Number of Chebyshev iterations. Defaults to 30
         ridge_ratio: Base regularization parameter (scaled by ||h_kk||_F). Defaults to 0.1
+        cu_seqlens: Cumulative sequence lengths with shape [N+1] for varlen inputs, or None.
+            Each packed sequence holds exactly one token. Defaults to None
 
     Returns:
         x_out: Solution vector with shape [B, 1, H, D]
         h_kk: Updated key-key covariance state with shape [B, H, D, D]
     """
     B, L, H, D = q.shape
+    N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
 
     h_kk = torch.empty_like(prev_h_kk)
 
-    grid = (B, H)
+    grid = (N, H)
 
     x_out = torch.empty_like(q)
 
@@ -323,6 +341,8 @@ def chebyshev_iteration_forward_triton_inference(
         # output:
         x_out,
         h_kk,
+        # varlen:
+        cu_seqlens,
         # constants:
         L,
         H,
@@ -348,6 +368,7 @@ def torch_decoding_one_step(
     num_iter: int,
     prev_h_kk: torch.Tensor,
     prev_h_kv: torch.Tensor,
+    cu_seqlens: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Single-step GKA inference with state management for autoregressive decoding.
@@ -368,14 +389,20 @@ def torch_decoding_one_step(
         num_iter: Iterations for iterative solvers. Set to 0 to skip ridge regression
         prev_h_kk: Previous key-key covariance state with shape [B, H, D, D] or None
         prev_h_kv: Previous key-value state with shape [B, H, D, D] or None
+        cu_seqlens: Cumulative sequence lengths with shape [N+1] used for variable-length
+            decoding, consistent with the FlashAttention API. `B` is expected to be 1 then, and
+            every packed sequence contributes exactly one token, so the packed length is `N`.
+            Defaults to None.
 
     Returns:
         o: Output tensor with shape [B, 1, H, D]
-        h_kk: Updated key-key covariance state with shape [B, H, D, D]
-        h_kv: Updated key-value state with shape [B, H, D, D]
+        h_kk: Updated key-key covariance state with shape [N, H, D, D]
+        h_kv: Updated key-value state with shape [N, H, D, D]
 
     Notes:
         Handles both batched [B, 1, H, D] and unbatched [1, H, D] inputs.
+        For variable-length inputs, pass the packed [1, N, H, D] tensors together with
+        `cu_seqlens`, one token per sequence.
         For parallel training, use gka_chebyshev_gla instead.
     """
 
@@ -384,12 +411,32 @@ def torch_decoding_one_step(
         k = k[None, ...]
         v = v[None, ...]
 
+    if cu_seqlens is not None:
+        N = len(cu_seqlens) - 1
+        if q.shape[0] != 1:
+            raise ValueError(
+                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`. "
+                f"Please flatten variable-length inputs before processing.",
+            )
+        if q.shape[1] != N:
+            raise ValueError(
+                "A single decoding step consumes exactly one token per sequence, so the number of packed "
+                f"tokens, i.e., {q.shape[1]}, is expected to be equal to the number of input sequences, "
+                f"i.e., {N}.",
+            )
+        if prev_h_kk is not None and prev_h_kk.shape[0] != N:
+            raise ValueError(
+                f"The number of initial states is expected to be equal to the number of input sequences, "
+                f"i.e., {N} rather than {prev_h_kk.shape[0]}.",
+            )
+
     q_ = q
 
     if num_iter > 0:
         if solver_type == "chebyshev":
             q_, h_kk = chebyshev_iteration_forward_triton_inference(
-                prev_h_kk, k, q_, gk, num_iter=num_iter, ridge_ratio=ridge_strength
+                prev_h_kk, k, q_, gk, num_iter=num_iter, ridge_ratio=ridge_strength,
+                cu_seqlens=cu_seqlens,
             )
         else:
             raise ValueError(f"Unknown GKA solver type: {solver_type}")
@@ -406,6 +453,7 @@ def torch_decoding_one_step(
         g=g,
         initial_state=prev_h_kv,
         output_final_state=True,
+        cu_seqlens=cu_seqlens,
     )
 
     return o, h_kk, h_kv
