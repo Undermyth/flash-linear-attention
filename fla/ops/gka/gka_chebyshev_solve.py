@@ -70,6 +70,8 @@ from fla.ops.utils.op import exp2
 
 from .chebyshev_iteration import ChebyshevIteration
 
+RCP_LN2_CONST = tl.constexpr(RCP_LN2)
+
 
 @torch.compiler.disable
 def latent_chebyshev(
@@ -247,7 +249,7 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     if USE_GK:
         gk_ptr += scalar_off
         gk = tl.load(gk_ptr).to(tl.float32)
-        gk_exp = exp2(gk * RCP_LN2)
+        gk_exp = exp2(gk * RCP_LN2_CONST)
     else:
         gk_exp = 1.0
 
