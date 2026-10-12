@@ -19,8 +19,11 @@ def naive_chunk_simple_gla(
     output_final_state: bool = False,
     chunk_size: int = 64,
     scale: float | None = None,
+    beta: torch.Tensor | None = None,
 ):
     q, k, v, g = map(lambda x: rearrange(x, 'b t h ... -> b h t ...').to(torch.float32), [q, k, v, g])
+    if beta is not None:
+        v = v * rearrange(beta, 'b t h -> b h t').to(torch.float32)[..., None]
     if scale is None:
         scale = 1.0 / q.shape[-1] ** 0.5
 
@@ -66,9 +69,12 @@ def naive_recurrent_simple_gla(
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = True,
+    beta: torch.Tensor | None = None,
 ):
     dtype = q.dtype
     q, k, v, g = map(lambda x: x.transpose(1, 2).float(), (q, k, v, g))
+    if beta is not None:
+        v = v * beta.transpose(1, 2).float()[..., None]
     B, H, T, K = q.shape
     V = v.shape[-1]
     if scale is None:

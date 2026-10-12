@@ -9,6 +9,7 @@ import torch
 
 from fla.ops.common.chunk_h import chunk_bwd_dh, chunk_fwd_h
 from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv, chunk_fwd_o
+from fla.ops.simple_gla.preprocess import prepare_simple_gla_inputs, validate_simple_gla_inputs
 from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices
 from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
@@ -247,6 +248,12 @@ def chunk_simple_gla(
     state_v_first: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
+    beta: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    use_beta_sigmoid_in_kernel: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
@@ -265,6 +272,28 @@ def chunk_simple_gla(
             Log decay of shape `[H]`.
             Head-wise data-independent decay is used if `g_gamma` is provided.
             Only one of `g` or `g_gamma` should be provided. Default: `None`.
+        beta (Optional[torch.Tensor]):
+            Head-wise write gate of shape `[B, T, H]`, applied to the rank-1 update:
+            `S_t = a_t * S_{t-1} + beta_t * k_t v_t^T`.
+            `beta=None` (default) is equivalent to an all-ones gate. Default: `None`.
+        use_qk_l2norm_in_kernel (Optional[bool]):
+            Whether to apply L2 normalization to `q` and `k` inside the operator.
+            Default: `False`.
+        use_gate_in_kernel (Optional[bool]):
+            Whether to compute the log-space decay internally.
+            When `True`, `g` is the raw pre-activation and `A_log` must be provided;
+            the operator fuses `-exp(A_log) * softplus(g + dt_bias)` and the chunk cumsum.
+            Default: `False`.
+        A_log (Optional[torch.Tensor]):
+            Decay parameter of shape `[H]`. Required when `use_gate_in_kernel=True`. Default: `None`.
+        dt_bias (Optional[torch.Tensor]):
+            Bias added to `g` before activation, of shape `[H]`.
+            Only used when `use_gate_in_kernel=True`. Default: `None`.
+        use_beta_sigmoid_in_kernel (Optional[bool]):
+            Whether to apply `torch.sigmoid` to `beta` inside the operator.
+            - If `True`, the passed `beta` acts as raw beta logits.
+            - If `False`, `beta` is expected to already be in post-sigmoid space.
+            Default: `False`.
         scale (Optional[float]):
             Scale factor for the attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
@@ -307,6 +336,12 @@ def chunk_simple_gla(
             initial_state=None,
             output_final_state=True
         )
+        # an optional head-wise `beta` write gate scales the rank-1 update
+        >>> beta = torch.rand(B, T, H, device='cuda').sigmoid()
+        >>> o, ht = chunk_simple_gla(
+            q, k, v, g, beta=beta,
+            output_final_state=True
+        )
         # for variable-length inputs, the batch size `B` is expected to be 1 and `cu_seqlens` is required
         >>> q, k, v, g = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, g))
         # for a batch with 4 sequences, `cu_seqlens` with 5 start/end positions are expected
@@ -338,6 +373,27 @@ def chunk_simple_gla(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    validate_simple_gla_inputs(
+        q=q,
+        beta=beta,
+        g=g,
+        g_gamma=g_gamma,
+        A_log=A_log,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+    )
+    q, k, v, g = prepare_simple_gla_inputs(
+        q,
+        k,
+        v,
+        beta,
+        g,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+    )
     o, final_state = ChunkSimpleGLAFunction.apply(
         q,
         k,

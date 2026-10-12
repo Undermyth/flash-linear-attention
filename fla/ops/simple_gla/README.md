@@ -8,3 +8,10 @@ It is faster than GLA but has less expressive power.
 I will use it as a baseline for the GLA.
 
 $S_{t+1} = g_{t+1} \odot S_{t} + K_{t+1} V_{t+1}^{\top}$ where $g$ is a scalar.
+
+An optional head-wise write gate `beta` of shape `[B, T, H]` scales the rank-1 update:
+
+$S_{t+1} = g_{t+1} \odot S_{t} + \beta_{t+1} K_{t+1} V_{t+1}^{\top}$
+
+With `beta = 1` this reduces to the recurrence above, and because the gate multiplies the
+write term only it is equivalent to scaling $V$ by `beta`.

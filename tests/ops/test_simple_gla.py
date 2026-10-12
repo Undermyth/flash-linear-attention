@@ -11,6 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from fla.modules.l2norm import l2norm
 from fla.ops.simple_gla.chunk import chunk_simple_gla
 from fla.ops.simple_gla.fused_chunk import fused_chunk_simple_gla
 from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
@@ -859,3 +860,307 @@ def test_simple_gla_to_mamba2(vary_A, dtype):
     assert y_rearrange.allclose(outputs_gla_fuse, 0, atol), f'y diff: {torch.abs(y_rearrange - outputs_gla_fuse).max()}'
     final_gla_fuse = final_gla_fuse.to(dtype)  # states hard-coded to float32 in FLA kernel
     assert final_rearrange.allclose(final_gla_fuse, 0, atol), f'final diff: {torch.abs(final_ssd - final_gla_fuse).max()}'
+
+
+# ---------------------------------------------------------------------------
+# `beta` head-wise write gate and the in-operator preprocessing flags
+# ---------------------------------------------------------------------------
+
+OPS = [chunk_simple_gla, fused_recurrent_simple_gla]
+OP_IDS = ['chunk', 'fused_recurrent']
+
+
+def _ratio_for_beta(dtype: torch.dtype) -> float:
+    # Folding `beta` into `v` costs one rounding at the value dtype; the measured
+    # max relative error for bf16 is ~4e-3 (vs ~3e-3 without the gate), so bf16
+    # gets a wider ratio than the fp32/fp16 matrix.
+    return 0.01 if dtype == torch.bfloat16 else 0.005
+
+
+def _run_beta(op, q, k, v, g, beta, h0, do, dht, **kwargs):
+    tensors = [None if x is None else x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta, h0)]
+    q_, k_, v_, g_, b_, h_ = tensors
+    o, ht = op(q=q_, k=k_, v=v_, g=g_, beta=b_, initial_state=h_, output_final_state=True, **kwargs)
+    ((o.float() * do).sum() + (ht * dht).sum()).backward()
+    return o, ht, q_.grad, k_.grad, v_.grad, (None if b_ is None else b_.grad), g_.grad, h_.grad
+
+
+def _run_beta_ext(op, q, k, v, g, beta, h0, do, dht, *, l2norm_qk=False, gate=None, beta_sigmoid=False):
+    """Run `op` with the flag preprocessing applied outside the operator, but *inside*
+    the autograd graph, so the gradients come back w.r.t. the same raw leaves the fused
+    (in-operator) path differentiates. Applying the preprocessing outside the graph
+    would return gradients w.r.t. the preprocessed tensors instead."""
+    leaf = {name: x.detach().clone().requires_grad_(True)
+            for name, x in dict(q=q, k=k, v=v, g=g, beta=beta, h0=h0).items()}
+    q_, k_, v_, g_, b_, h_ = leaf['q'], leaf['k'], leaf['v'], leaf['g'], leaf['beta'], leaf['h0']
+
+    if l2norm_qk:
+        q_, k_ = l2norm(q_), l2norm(k_)
+    if gate is not None:
+        a_log, dt_bias = gate
+        a_ = a_log.detach().clone().requires_grad_(True)
+        g_in = g_ if dt_bias is None else g_ + dt_bias.detach().clone().requires_grad_(True)
+        g_ = -a_.exp() * F.softplus(g_in)
+    if beta_sigmoid:
+        b_ = b_.sigmoid()
+
+    o, ht = op(q=q_, k=k_, v=v_, g=g_, beta=b_, initial_state=h_, output_final_state=True)
+    ((o.float() * do).sum() + (ht * dht).sum()).backward()
+    return (o, ht, leaf['q'].grad, leaf['k'].grad, leaf['v'].grad,
+            leaf['beta'].grad, leaf['g'].grad, leaf['h0'].grad)
+
+
+def _assert_runs_close(prefix, ref, tri, ratio):
+    for name, a, b in zip(('o', 'ht', 'dq', 'dk', 'dv', 'dbeta', 'dg', 'dh0'), ref, tri, strict=False):
+        if a is None and b is None:
+            continue
+        assert a is not None and b is not None, f'{prefix}.{name}: ref={a is not None} tri={b is not None}'
+        assert_close(f'{prefix}.{name}', a, b, ratio, err_atol=2e-4 if name == 'dg' else 1e-6)
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'D', 'scale', 'gate_logit_normalizer', 'dtype'),
+    [
+        pytest.param(*test, id="B{}-T{}-H{}-D{}-scale{}-gate{}-{}".format(*test))
+        for test in [
+            (1, 63, 1, 64, 1, 1, torch.float),
+            (2, 500, 4, 60, 1, 1, torch.float),
+            (2, 1024, 4, 128, 0.1, 1, torch.float16),
+            (2, 256, 4, 64, 1, 1, torch.bfloat16),
+        ]
+    ],
+)
+@pytest.mark.parametrize('op', OPS, ids=OP_IDS)
+def test_beta(op, B, T, H, D, scale, gate_logit_normalizer, dtype):
+    torch.manual_seed(42)
+    os.environ['TRITON_F32_DEFAULT'] = 'ieee'
+    ratio = _ratio_for_beta(dtype)
+
+    q = torch.randn((B, T, H, D), dtype=dtype, device=device)
+    k = torch.randn((B, T, H, D), dtype=dtype, device=device)
+    v = torch.randn((B, T, H, D), dtype=dtype, device=device)
+    g = F.logsigmoid(torch.randn((B, T, H), dtype=torch.float32, device=device)) / gate_logit_normalizer
+    beta = torch.rand((B, T, H), dtype=torch.float32, device=device)
+    h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
+    qr, kr, vr, gr, br, hr = (x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta, h0))
+    ref_o, ref_ht = naive_recurrent_simple_gla(
+        q=qr, k=kr, v=vr, g=gr, scale=scale,
+        initial_state=hr, output_final_state=True, beta=br,
+    )
+    ((ref_o * do).sum() + (ref_ht * dht).sum()).backward()
+    ref = (ref_o, ref_ht, qr.grad, kr.grad, vr.grad, br.grad, gr.grad, hr.grad)
+
+    tri = _run_beta(op, q, k, v, g, beta, h0, do, dht, scale=scale)
+    assert tri[5] is not None, 'dbeta is None'
+    _assert_runs_close(op.__name__, ref, tri, ratio)
+
+
+@pytest.mark.parametrize(
+    ('H', 'D', 'scale', 'cu_seqlens', 'dtype'),
+    [
+        pytest.param(*test, id="H{}-D{}-cu_seqlens{}-{}".format(*test))
+        for test in [
+            (4, 64, 1, [0, 15], torch.float),
+            (4, 64, 1, [0, 256, 500, 1000], torch.float),
+            (4, 64, 1, [0, 15], torch.float16),
+        ]
+    ],
+)
+@pytest.mark.parametrize('op', OPS, ids=OP_IDS)
+def test_beta_varlen(op, H, D, scale, cu_seqlens, dtype):
+    torch.manual_seed(42)
+    os.environ['TRITON_F32_DEFAULT'] = 'ieee'
+    ratio = _ratio_for_beta(dtype)
+
+    N = len(cu_seqlens) - 1
+    T = cu_seqlens[-1]
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+
+    q = torch.randn((1, T, H, D), dtype=dtype, device=device)
+    k = torch.randn((1, T, H, D), dtype=dtype, device=device)
+    v = torch.randn((1, T, H, D), dtype=dtype, device=device)
+    g = F.logsigmoid(torch.randn((1, T, H), dtype=torch.float32, device=device))
+    beta = torch.rand((1, T, H), dtype=torch.float32, device=device)
+    h0 = torch.randn(N, H, D, D, dtype=torch.float32, device=device)
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
+    qr, kr, vr, gr, br, hr = (x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta, h0))
+    refs, ref_hts = [], []
+    for i, (bos, eos) in enumerate(zip(cu_seqlens[:-1], cu_seqlens[1:], strict=False)):
+        ref_o, ref_ht = naive_recurrent_simple_gla(
+            q=qr[:, bos:eos], k=kr[:, bos:eos], v=vr[:, bos:eos], g=gr[:, bos:eos],
+            scale=scale, initial_state=hr[i], output_final_state=True, beta=br[:, bos:eos],
+        )
+        refs.append(ref_o)
+        ref_hts.append(ref_ht)
+    ref_o, ref_ht = torch.cat(refs, 1), torch.cat(ref_hts, 0)
+    ((ref_o * do).sum() + (ref_ht * dht).sum()).backward()
+    ref = (ref_o, ref_ht, qr.grad, kr.grad, vr.grad, br.grad, gr.grad, hr.grad)
+
+    tri = _run_beta(op, q, k, v, g, beta, h0, do, dht, scale=scale, cu_seqlens=cu)
+    assert tri[5] is not None, 'dbeta is None'
+    _assert_runs_close(f'{op.__name__}/varlen', ref, tri, ratio)
+
+
+@pytest.mark.parametrize('op', OPS, ids=OP_IDS)
+def test_beta_flags_match_external_preprocessing(op):
+    torch.manual_seed(42)
+    os.environ['TRITON_F32_DEFAULT'] = 'ieee'
+    B, T, H, D = 2, 128, 4, 64
+
+    q = torch.randn(B, T, H, D, device=device)
+    k = torch.randn(B, T, H, D, device=device)
+    v = torch.randn(B, T, H, D, device=device)
+    g = F.logsigmoid(torch.randn(B, T, H, device=device))
+    beta = torch.rand(B, T, H, device=device)
+    h0 = torch.randn(B, H, D, D, device=device)
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+    A_log = -torch.rand(H, device=device) - 0.05
+    dt_bias = torch.randn(H, device=device)
+
+    # q/k L2 normalization
+    ext = _run_beta_ext(op, q, k, v, g, beta, h0, do, dht, l2norm_qk=True)
+    fused = _run_beta(op, q, k, v, g, beta, h0, do, dht, use_qk_l2norm_in_kernel=True)
+    _assert_runs_close(f'{op.__name__}/l2norm', ext, fused, 1e-5)
+
+    # decay-gate activation
+    ext = _run_beta_ext(op, q, k, v, g, beta, h0, do, dht, gate=(A_log, dt_bias))
+    fused = _run_beta(op, q, k, v, g, beta, h0, do, dht,
+                      use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias)
+    _assert_runs_close(f'{op.__name__}/gate', ext, fused, 0.005)
+
+    # beta sigmoid
+    ext = _run_beta_ext(op, q, k, v, g, beta, h0, do, dht, beta_sigmoid=True)
+    fused = _run_beta(op, q, k, v, g, beta, h0, do, dht, use_beta_sigmoid_in_kernel=True)
+    _assert_runs_close(f'{op.__name__}/beta_sigmoid', ext, fused, 1e-4)
+
+    # all flags at once
+    ext = _run_beta_ext(op, q, k, v, g, beta, h0, do, dht,
+                        l2norm_qk=True, gate=(A_log, dt_bias), beta_sigmoid=True)
+    fused = _run_beta(op, q, k, v, g, beta, h0, do, dht, use_qk_l2norm_in_kernel=True,
+                      use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
+                      use_beta_sigmoid_in_kernel=True)
+    _assert_runs_close(f'{op.__name__}/all_flags', ext, fused, 0.005)
+
+
+@pytest.mark.parametrize('op', OPS, ids=OP_IDS)
+def test_beta_default_parity(op):
+    """An omitted `beta`/flag matches its documented explicit default."""
+    torch.manual_seed(42)
+    os.environ['TRITON_F32_DEFAULT'] = 'ieee'
+    B, T, H, D = 2, 128, 2, 64
+
+    q = torch.randn(B, T, H, D, device=device)
+    k = torch.randn(B, T, H, D, device=device)
+    v = torch.randn(B, T, H, D, device=device)
+    g = F.logsigmoid(torch.randn(B, T, H, device=device))
+    beta = torch.ones(B, T, H, device=device)
+    h0 = torch.randn(B, H, D, D, device=device)
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
+    # `beta=ones` is exactly the gate-free recurrence
+    default = _run_beta(op, q, k, v, g, beta, h0, do, dht)
+    omitted = _run_beta(op, q, k, v, g, None, h0, do, dht)
+    # `dbeta` is absent when `beta` is omitted, so it is compared only against `ones`
+    # (already covered by `test_beta`); the rest must match bit for bit.
+    keep = (0, 1, 2, 3, 4, 6, 7)
+    for name, a, b in zip(('o', 'ht', 'dq', 'dk', 'dv', 'dg', 'dh0'),
+                          [default[i] for i in keep], [omitted[i] for i in keep], strict=False):
+        assert_close(f'{op.__name__}/ones.{name}', a, b, 1e-6)
+
+    # explicit `False` flags select the same route as omitting them
+    explicit = _run_beta(op, q, k, v, g, None, h0, do, dht, use_qk_l2norm_in_kernel=False,
+                         use_gate_in_kernel=False, use_beta_sigmoid_in_kernel=False)
+    _assert_runs_close(f'{op.__name__}/explicit_defaults', omitted, explicit, 1e-6)
+
+
+@pytest.mark.parametrize('op', OPS, ids=OP_IDS)
+def test_beta_invalid_combinations(op):
+    torch.manual_seed(42)
+    B, T, H, D = 1, 32, 2, 32
+
+    q = torch.randn(B, T, H, D, device=device)
+    k = torch.randn(B, T, H, D, device=device)
+    v = torch.randn(B, T, H, D, device=device)
+    g = F.logsigmoid(torch.randn(B, T, H, device=device))
+    A_log = -torch.rand(H, device=device) - 0.05
+    dt_bias = torch.zeros(H, device=device)
+
+    cases = [
+        ({'g': None, 'use_gate_in_kernel': True}, 'A_log'),
+        ({'g': None, 'use_gate_in_kernel': True, 'A_log': A_log}, 'pre-activation'),
+        ({'use_gate_in_kernel': True, 'A_log': A_log, 'dt_bias': dt_bias,
+          'g_gamma': torch.zeros(H, device=device)}, 'g_gamma'),
+        ({'use_beta_sigmoid_in_kernel': True}, 'beta'),
+        ({'beta': torch.rand(T, H, device=device)}, 'leading'),
+    ]
+    for overrides, match in cases:
+        call = dict(q=q, k=k, v=v, g=g)
+        call.update(overrides)
+        with pytest.raises(ValueError, match=match):
+            op(**call)
+
+
+@pytest.mark.parametrize('op', OPS, ids=OP_IDS)
+def test_beta_state_v_first(op):
+    torch.manual_seed(42)
+    os.environ['TRITON_F32_DEFAULT'] = 'ieee'
+    B, T, H, D = 2, 256, 4, 64
+
+    q = torch.randn(B, T, H, D, device=device)
+    k = torch.randn(B, T, H, D, device=device)
+    v = torch.randn(B, T, H, D, device=device)
+    g = F.logsigmoid(torch.randn(B, T, H, device=device))
+    beta = torch.rand(B, T, H, device=device)
+    h0 = torch.randn(B, H, D, D, device=device)
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
+    def run(state_v_first: bool):
+        h0_in = h0.transpose(-1, -2).contiguous() if state_v_first else h0.clone()
+        dht_in = dht.transpose(-1, -2).contiguous() if state_v_first else dht
+        q_, k_, v_, g_, b_ = (x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta))
+        h_ = h0_in.requires_grad_()
+        o, ht = op(q=q_, k=k_, v=v_, g=g_, beta=b_, initial_state=h_, output_final_state=True,
+                   state_v_first=state_v_first)
+        ((o.float() * do).sum() + (ht * dht_in).sum()).backward()
+        return o, ht, q_.grad, k_.grad, v_.grad, b_.grad, g_.grad, h_.grad
+
+    ref, tri = run(False), run(True)
+    assert_close('o', ref[0], tri[0], 0.005)
+    assert_close('ht', ref[1], tri[1].transpose(-1, -2), 0.005)
+    for name, a, b in zip(('dq', 'dk', 'dv', 'dbeta', 'dg'), ref[2:7], tri[2:7], strict=False):
+        assert_close(name, a, b, 0.005, err_atol=2e-4 if name == 'dg' else 1e-6)
+    assert_close('dh0', ref[7], tri[7].transpose(-1, -2), 0.005)
+
+
+@pytest.mark.parametrize('op', OPS, ids=OP_IDS)
+def test_beta_with_g_gamma(op):
+    torch.manual_seed(42)
+    os.environ['TRITON_F32_DEFAULT'] = 'ieee'
+    B, T, H, D = 2, 256, 4, 64
+
+    q = torch.randn(B, T, H, D, device=device)
+    k = torch.randn(B, T, H, D, device=device)
+    v = torch.randn(B, T, H, D, device=device)
+    beta = torch.rand(B, T, H, device=device)
+    g_gamma = (1 - torch.pow(torch.tensor(2.0, device=device), -5.0 - torch.arange(H, device=device))).log()
+    h0 = torch.randn(B, H, D, D, device=device)
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
+    q_, k_, v_, b_ = (x.detach().clone().requires_grad_(True) for x in (q, k, v, beta))
+    h_ = h0.detach().clone().requires_grad_(True)
+    o, ht = op(q=q_, k=k_, v=v_, g=None, g_gamma=g_gamma, beta=b_,
+               initial_state=h_, output_final_state=True)
+    assert torch.isfinite(o).all() and torch.isfinite(ht).all()
+    ((o.float() * do).sum() + (ht * dht).sum()).backward()
+    for name, grad in (('dq', q_.grad), ('dk', k_.grad), ('dv', v_.grad),
+                       ('dbeta', b_.grad), ('dh0', h_.grad)):
+        assert grad is not None and torch.isfinite(grad).all(), f'{name} is not finite'
