@@ -55,6 +55,7 @@ from torch.nn import functional as F
 
 from fla.layers.utils import get_layer_cache, repad_hidden_states, unpad_hidden_states, update_layer_cache
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
+from fla.modules.l2norm import l2_norm
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
@@ -500,12 +501,14 @@ class GatedKalmaNet(nn.Module):
 
         # Normalize queries and keys
         qk_norm_eps = 1e-6
-        q = q / (
-            torch.linalg.vector_norm(q, dim=-1, keepdim=True).to(q) + qk_norm_eps
-        )  # [B_sp, Lp, H, D]
-        k = k / (
-            torch.linalg.vector_norm(k, dim=-1, keepdim=True).to(k) + qk_norm_eps
-        )  # [B_sp, Lp, H, D]
+        # q = q / (
+        #     torch.linalg.vector_norm(q, dim=-1, keepdim=True).to(q) + qk_norm_eps
+        # )  # [B_sp, Lp, H, D]
+        # k = k / (
+        #     torch.linalg.vector_norm(k, dim=-1, keepdim=True).to(k) + qk_norm_eps
+        # )  # [B_sp, Lp, H, D]
+        q = l2_norm(q, eps=qk_norm_eps, output_dtype=torch.float16)
+        k = l2_norm(k, eps=qk_norm_eps, output_dtype=torch.float16)
 
         # Apply beta gating if enabled
         if self.use_beta_gate:
@@ -513,7 +516,7 @@ class GatedKalmaNet(nn.Module):
             beta = self.b_proj(hidden_states).float().sigmoid()  # [B_sp, Lp, H]
             eps = 1e-6
             k = ((beta[..., None] + eps) * k).to(k.dtype)  # [B_sp, Lp, H, D]
-            v = ((beta[..., None] + eps) * v).to(v.dtype)  # [B_sp, Lp, H, D]
+            v = ((beta[..., None] + eps) * v).to(k.dtype)  # [B_sp, Lp, H, D]
 
         # Compute alpha connection parameter
         if self.use_alpha_connection:

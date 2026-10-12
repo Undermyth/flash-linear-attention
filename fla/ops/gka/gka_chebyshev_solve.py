@@ -177,7 +177,7 @@ def gka_chebyshev_gla(
         kk_final = None
 
     o, kv_final = chunk_simple_gla(
-        q=q, k=k, v=v, scale=gla_scale, g=g, output_final_state=True,
+        q=q.bfloat16(), k=k.bfloat16(), v=v.bfloat16(), scale=gla_scale, g=g, output_final_state=True,
         cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
     )
 
