@@ -157,6 +157,7 @@ def chebyshev_iteration_fro_forward_kernel(
     # algorithm parameters:
     num_iter: tl.constexpr,
     ridge_ratio: tl.constexpr,
+    FLOOR_FRO: tl.constexpr,
     load_fro: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
@@ -222,8 +223,12 @@ def chebyshev_iteration_fro_forward_kernel(
     else:
         fro = tl.zeros((chunk_size, 1), dtype=tl.float32)
         h_kk_fro = tl.dot(k, tl.trans(k))  # CxC
+        # (k_i . k_j)^2 underflows fp16 (~3e-8) once the beta gate shrinks |k| below
+        # ~0.016; the Frobenius norm is then underestimated and stepsize
+        # 2 / (2 * ridge + fro) exceeds the Chebyshev stability limit 2 / lambda_max,
+        # so the iteration diverges. Keep this reduction in fp32 (tf32 dot; CxC is tiny).
         fro += tl.sum(
-            tl.dot(mask, (h_kk_fro * h_kk_fro).to(q.dtype)) * mask,
+            tl.dot(mask.to(tl.float32), h_kk_fro * h_kk_fro) * mask,
             axis=1,
             keep_dims=True,
         )
@@ -234,6 +239,15 @@ def chebyshev_iteration_fro_forward_kernel(
             + 2 * tl.cumsum(tl.sum(k * tl.dot(k.to(h_kk.dtype), h_kk), axis=1))[:, None]
             + fro
         )
+
+    # Keep the ridge strength (lambda = ridge_ratio * fro) bounded away from zero.
+    # When the gate has wiped the history and the beta gate shrinks the key, fro can
+    # collapse to ~||k_t||^2 << 1, and the solution x ~ q / lambda then overflows
+    # fp16 (max 65504) both in the iterates and at the final store. The floor only
+    # engages where the state is nearly forgotten; elsewhere it is a no-op.
+    # Note: the floored value is also what gets stored to `fro` below, so the
+    # backward pass (load_fro=1) stays consistent with the forward.
+    fro = tl.maximum(fro, FLOOR_FRO)
 
     ridge_strength = ridge_ratio * fro
 
@@ -310,6 +324,7 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     # algorithm parameters:
     num_iter: tl.constexpr,
     ridge_ratio: tl.constexpr,
+    FLOOR_FRO: tl.constexpr,
     load_fro: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
@@ -382,8 +397,12 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     else:
         fro = tl.zeros((chunk_size, 1), dtype=tl.float32)
         h_kk_fro = tl.dot(k, tl.trans(k))  # CxC
+        # (k_i . k_j)^2 underflows fp16 (~3e-8) once the beta gate shrinks |k| below
+        # ~0.016; the Frobenius norm is then underestimated and stepsize
+        # 2 / (2 * ridge + fro) exceeds the Chebyshev stability limit 2 / lambda_max,
+        # so the iteration diverges. Keep this reduction in fp32 (tf32 dot; CxC is tiny).
         fro += tl.sum(
-            tl.dot(mask, (h_kk_fro * h_kk_fro).to(q.dtype)) * mask,
+            tl.dot(mask.to(tl.float32), h_kk_fro * h_kk_fro) * mask,
             axis=1,
             keep_dims=True,
         )
@@ -401,6 +420,15 @@ def chebyshev_iteration_fro_gating_forward_kernel(
                 keep_dims=True,
             )
         )
+
+    # Keep the ridge strength (lambda = ridge_ratio * fro) bounded away from zero.
+    # When the gate has wiped the history and the beta gate shrinks the key, fro can
+    # collapse to ~||k_t||^2 << 1, and the solution x ~ q / lambda then overflows
+    # fp16 (max 65504) both in the iterates and at the final store. The floor only
+    # engages where the state is nearly forgotten; elsewhere it is a no-op.
+    # Note: the floored value is also what gets stored to `fro` below, so the
+    # backward pass (load_fro=1) stays consistent with the forward.
+    fro = tl.maximum(fro, FLOOR_FRO)
 
     ridge_strength = ridge_ratio * fro
 
@@ -453,6 +481,7 @@ def chebyshev_iteration_forward_triton(
     fro: torch.Tensor,
     num_iter: int = 30,
     ridge_ratio: float = 0.02,
+    fro_floor: float = 1e-2,
     chunk_size: int = 64,
     load_fro: int = 0,
     output_final_state: bool = False,
@@ -531,6 +560,7 @@ def chebyshev_iteration_forward_triton(
             # algorithm parameters:
             num_iter=num_iter,
             ridge_ratio=ridge_ratio,
+            FLOOR_FRO=fro_floor,
             load_fro=load_fro,
         )
     else:
@@ -554,6 +584,7 @@ def chebyshev_iteration_forward_triton(
             # algorithm parameters:
             num_iter=num_iter,
             ridge_ratio=ridge_ratio,
+            FLOOR_FRO=fro_floor,
             load_fro=load_fro,
         )
 

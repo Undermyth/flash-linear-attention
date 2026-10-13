@@ -206,6 +206,7 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     # algorithm parameters:
     num_iter: tl.constexpr,
     ridge_ratio: tl.constexpr,
+    FLOOR_FRO: tl.constexpr,
     USE_GK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
@@ -256,6 +257,10 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     h_kk_ = h_kk * gk_exp + k[:, None] * k[None, :]
     fro = tl.sqrt(tl.sum(h_kk_ * h_kk_))
 
+    # Keep the ridge strength (lambda = ridge_ratio * fro) bounded away from zero so
+    # the solution x ~ q / lambda stays representable in fp16 when the state is nearly
+    # forgotten (same rationale as the chunked training kernels in chebyshev_iteration.py).
+    fro = tl.maximum(fro, FLOOR_FRO)
     ridge_strength = ridge_ratio * fro
 
     stepsize = 2 / (2 * ridge_strength + fro)
@@ -303,6 +308,7 @@ def chebyshev_iteration_forward_triton_inference(
     gk: torch.Tensor,
     num_iter: int = 30,
     ridge_ratio: float = 0.1,
+    fro_floor: float = 1e-2,
     cu_seqlens: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -352,6 +358,7 @@ def chebyshev_iteration_forward_triton_inference(
         # algorithm parameters:
         num_iter,
         ridge_ratio,
+        FLOOR_FRO=fro_floor,
     )
 
     return x_out, h_kk
