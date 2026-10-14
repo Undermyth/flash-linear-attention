@@ -39,6 +39,7 @@ def chunk_bwd_dk_kernel(
     chunk_size: tl.constexpr,
     # algorithm parameters:
     ridge_ratio: tl.constexpr,
+    FLOOR_FRO: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     """
@@ -105,7 +106,10 @@ def chunk_bwd_dk_kernel(
 
     # masked rows would divide by a zero `fro`, and the NaNs would then leak
     # through the reverse cumsum into valid rows
-    w = tl.where(m_t, ridge_ratio * tl.sum(dq * x_out, axis=1) / fro, 0.0)
+    # fp32 reduction (fp16 tl.sum saturates) and zero the lambda adjoint on the
+    # rows where the forward floored `fro` (max() has zero derivative there).
+    tmp = tl.where(fro >= FLOOR_FRO, tl.sum(dq.to(tl.float32) * x_out.to(tl.float32), axis=1), 0.0)
+    w = tl.where(m_t, ridge_ratio * tmp / fro, 0.0)
     weights = tl.cumsum(w, reverse=True)
     k_weight = (weights[:, None] * k).to(k.dtype)
 
@@ -245,6 +249,7 @@ def chunk_bwd_dk(
     h_kk_final=None,
     chunk_size: int = 64,
     ridge_ratio: float = 0.02,
+    fro_floor: float = 1e-2,
     cu_seqlens: Tensor | None = None,
     chunk_indices: Tensor | None = None,
 ) -> Tensor:
@@ -285,6 +290,7 @@ def chunk_bwd_dk(
             BD=BD,
             chunk_size=chunk_size,
             ridge_ratio=ridge_ratio,
+            FLOOR_FRO=fro_floor,
         )
 
         dk_final = torch.empty_like(k)
@@ -327,6 +333,7 @@ def chunk_bwd_dk(
             chunk_size,
             # algorithm parameters:
             ridge_ratio,
+            FLOOR_FRO=fro_floor,
         )
         return dk
 
@@ -356,6 +363,7 @@ def chunk_bwd_dk_kernel_single_pass(
     chunk_size: tl.constexpr,
     # algorithm parameters:
     ridge_ratio: tl.constexpr,
+    FLOOR_FRO: tl.constexpr,
 ):
     """
     Single-pass backward for key gradients when final h_kk state is available.
@@ -416,7 +424,9 @@ def chunk_bwd_dk_kernel_single_pass(
         # fro norm
         dk += 2 * tl.dot(k, h_kk_suffix_sum.to(k.dtype))
 
-        weights = ridge_ratio * tl.sum(dq * x_out, axis=1) / fro
+        weights = ridge_ratio * tl.where(
+            fro >= FLOOR_FRO, tl.sum(dq.to(tl.float32) * x_out.to(tl.float32), axis=1), 0.0
+        ) / fro
         h_kk_suffix_sum += tl.sum(weights) * h_kk
 
         weights = tl.cumsum(weights, reverse=True)

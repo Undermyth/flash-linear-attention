@@ -136,7 +136,7 @@ def chunk_dh_kk_to_dk_gating_kernel(
     dgkk_last = tl.sum(dk2 * k, axis=1)
     dgkk -= dgkk_last
     dgkk_last = tl.sum(dgkk_last)
-    dgkk_last += tl.sum(d_kk * kk) * exp2(gkk_last)
+    dgkk_last += tl.sum(d_kk.to(tl.float32) * kk.to(tl.float32)) * exp2(gkk_last)
 
     dgkk = tl.where(chunk_range < tl.minimum(chunk_size - 1, T - i_c * chunk_size - 1), dgkk, dgkk + dgkk_last)
 

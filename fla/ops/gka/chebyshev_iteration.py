@@ -13,6 +13,13 @@ from .chunk_dh_kk_to_dk_gating_backward import chunk_dh_kk_to_dk_gating
 from .chunk_dk_backward import chunk_bwd_dk
 from .chunk_dk_backward_gating import chunk_bwd_dk_gating
 
+# Lower bound on the Frobenius estimate that sets the Chebyshev ridge.
+# It is a *forward-only* device: it keeps the solve gain 1/lambda bounded so
+# that the fp16 matvec operands (x, h_kk, k) stay inside fp16 range. It must
+# never be baked into the value handed to the backward pass -- see
+# ChebyshevIteration.backward / chunk_bwd_dk_gating(fro_floor=...).
+FRO_FLOOR = 1e-2
+
 
 @triton.autotune(
     configs=[
@@ -215,29 +222,31 @@ def chebyshev_iteration_fro_forward_kernel(
         tl.arange(0, chunk_size)[:, None] >= tl.arange(0, chunk_size)[None, :], 1, 0
     ).to(q.dtype)
 
+    # `fro_raw` is the true ||H_t||_F; `fro` below is what the iteration uses.
+    # Only `fro_raw` is ever handed to the backward pass (see the store at the end).
     if load_fro == 1:
         fro_ptr += scalar_off
-        fro = tl.load(
+        fro_raw = tl.load(
             fro_ptr + o_t[:, None] * H, mask=m_t[:, None], other=0.0
         )
     else:
-        fro = tl.zeros((chunk_size, 1), dtype=tl.float32)
+        fro_raw = tl.zeros((chunk_size, 1), dtype=tl.float32)
         h_kk_fro = tl.dot(k, tl.trans(k))  # CxC
         # (k_i . k_j)^2 underflows fp16 (~3e-8) once the beta gate shrinks |k| below
         # ~0.016; the Frobenius norm is then underestimated and stepsize
         # 2 / (2 * ridge + fro) exceeds the Chebyshev stability limit 2 / lambda_max,
         # so the iteration diverges. Keep this reduction in fp32 (tf32 dot; CxC is tiny).
-        fro += tl.sum(
+        fro_raw += tl.sum(
             tl.dot(mask.to(tl.float32), h_kk_fro * h_kk_fro) * mask,
             axis=1,
             keep_dims=True,
         )
         # h_kk grows with the accumulated history, so both the elementwise square and the
         # reduction have to leave fp16 to avoid inf in `fro`
-        fro = tl.sqrt(
+        fro_raw = tl.sqrt(
             tl.sum(h_kk.to(tl.float32) * h_kk.to(tl.float32))
             + 2 * tl.cumsum(tl.sum(k * tl.dot(k.to(h_kk.dtype), h_kk), axis=1))[:, None]
-            + fro
+            + fro_raw
         )
 
     # Keep the ridge strength (lambda = ridge_ratio * fro) bounded away from zero.
@@ -245,9 +254,10 @@ def chebyshev_iteration_fro_forward_kernel(
     # collapse to ~||k_t||^2 << 1, and the solution x ~ q / lambda then overflows
     # fp16 (max 65504) both in the iterates and at the final store. The floor only
     # engages where the state is nearly forgotten; elsewhere it is a no-op.
-    # Note: the floored value is also what gets stored to `fro` below, so the
-    # backward pass (load_fro=1) stays consistent with the forward.
-    fro = tl.maximum(fro, FLOOR_FRO)
+    # What gets stored below is `fro_raw`, not `fro`: the backward needs the raw
+    # norm both to rebuild the same floored constants (load_fro=1 re-applies the
+    # clamp) and to know which rows the clamp actually masked.
+    fro = tl.maximum(fro_raw, FLOOR_FRO)
 
     ridge_strength = ridge_ratio * fro
 
@@ -289,7 +299,7 @@ def chebyshev_iteration_fro_forward_kernel(
         fro_ptr += scalar_off
         tl.store(
             fro_ptr + o_t[:, None] * H,
-            fro.to(fro_ptr.dtype.element_ty, fp_downcast_rounding="rtne"),
+            fro_raw.to(fro_ptr.dtype.element_ty, fp_downcast_rounding="rtne"),
             mask=m_t[:, None],
         )
 
@@ -389,19 +399,21 @@ def chebyshev_iteration_fro_gating_forward_kernel(
 
     exp_gkk = exp2(gkk[:, None])
 
+    # `fro_raw` is the true ||H_t||_F; `fro` below is what the iteration uses.
+    # Only `fro_raw` is ever handed to the backward pass (see the store at the end).
     if load_fro == 1:
         fro_ptr += scalar_off
-        fro = tl.load(
+        fro_raw = tl.load(
             fro_ptr + o_t[:, None] * H, mask=m_t[:, None], other=0.0
         )
     else:
-        fro = tl.zeros((chunk_size, 1), dtype=tl.float32)
+        fro_raw = tl.zeros((chunk_size, 1), dtype=tl.float32)
         h_kk_fro = tl.dot(k, tl.trans(k))  # CxC
         # (k_i . k_j)^2 underflows fp16 (~3e-8) once the beta gate shrinks |k| below
         # ~0.016; the Frobenius norm is then underestimated and stepsize
         # 2 / (2 * ridge + fro) exceeds the Chebyshev stability limit 2 / lambda_max,
         # so the iteration diverges. Keep this reduction in fp32 (tf32 dot; CxC is tiny).
-        fro += tl.sum(
+        fro_raw += tl.sum(
             tl.dot(mask.to(tl.float32), h_kk_fro * h_kk_fro) * mask,
             axis=1,
             keep_dims=True,
@@ -409,9 +421,9 @@ def chebyshev_iteration_fro_gating_forward_kernel(
 
         # h_kk grows with the accumulated history, so both the elementwise square and the
         # reduction have to leave fp16 to avoid inf in `fro`
-        fro += exp_gkk * (exp_gkk * tl.sum(h_kk.to(tl.float32) * h_kk.to(tl.float32)))
-        fro = tl.sqrt(
-            fro
+        fro_raw += exp_gkk * (exp_gkk * tl.sum(h_kk.to(tl.float32) * h_kk.to(tl.float32)))
+        fro_raw = tl.sqrt(
+            fro_raw
             + 2
             * exp_gkk
             * tl.sum(
@@ -426,9 +438,10 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     # collapse to ~||k_t||^2 << 1, and the solution x ~ q / lambda then overflows
     # fp16 (max 65504) both in the iterates and at the final store. The floor only
     # engages where the state is nearly forgotten; elsewhere it is a no-op.
-    # Note: the floored value is also what gets stored to `fro` below, so the
-    # backward pass (load_fro=1) stays consistent with the forward.
-    fro = tl.maximum(fro, FLOOR_FRO)
+    # What gets stored below is `fro_raw`, not `fro`: the backward needs the raw
+    # norm both to rebuild the same floored constants (load_fro=1 re-applies the
+    # clamp) and to know which rows the clamp actually masked.
+    fro = tl.maximum(fro_raw, FLOOR_FRO)
 
     ridge_strength = ridge_ratio * fro
 
@@ -469,7 +482,7 @@ def chebyshev_iteration_fro_gating_forward_kernel(
         fro_ptr += scalar_off
         tl.store(
             fro_ptr + o_t[:, None] * H,
-            fro.to(fro_ptr.dtype.element_ty, fp_downcast_rounding="rtne"),
+            fro_raw.to(fro_ptr.dtype.element_ty, fp_downcast_rounding="rtne"),
             mask=m_t[:, None],
         )
 
@@ -481,7 +494,7 @@ def chebyshev_iteration_forward_triton(
     fro: torch.Tensor,
     num_iter: int = 30,
     ridge_ratio: float = 0.02,
-    fro_floor: float = 1e-2,
+    fro_floor: float = FRO_FLOOR,
     chunk_size: int = 64,
     load_fro: int = 0,
     output_final_state: bool = False,
@@ -726,6 +739,7 @@ class ChebyshevIteration(torch.autograd.Function):
                     h_kk_final,
                     chunk_size=chunk_size,
                     ridge_ratio=ridge_ratio,
+                    fro_floor=FRO_FLOOR,
                     cu_seqlens=cu_seqlens,
                     chunk_indices=chunk_indices,
                 )
@@ -748,6 +762,7 @@ class ChebyshevIteration(torch.autograd.Function):
                     gkk,
                     chunk_size=chunk_size,
                     ridge_ratio=ridge_ratio,
+                    fro_floor=FRO_FLOOR,
                     cu_seqlens=cu_seqlens,
                     chunk_indices=chunk_indices,
                 )

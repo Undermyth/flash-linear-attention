@@ -33,6 +33,7 @@ def chunk_bwd_dk_gating_kernel(
     chunk_size: tl.constexpr,
     # algorithm parameters:
     ridge_ratio: tl.constexpr,
+    FLOOR_FRO: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     """
@@ -126,12 +127,19 @@ def chunk_bwd_dk_gating_kernel(
     dgkk_last = tl.sum(dk2 * k, axis=1)
     dgkk -= dgkk_last
     dgkk_last = tl.sum(dgkk_last)
-    dgkk_last += tl.sum(d_kk * h_kk) * exp2(gkk_last)
+    dgkk_last += tl.sum(d_kk.to(tl.float32) * h_kk.to(tl.float32)) * exp2(gkk_last)
 
     dgkk = tl.where(chunk_range < tl.minimum(chunk_size - 1, T - i_c * chunk_size - 1), dgkk, dgkk + dgkk_last)
 
     fro = tl.load(p_fro, mask=m_t, other=0.0).to(tl.float32)
-    tmp = ridge_ratio * tl.sum(dq * x_out, axis=1)
+    # `dq`/`x_out` can be fp16, and a bare tl.sum on an fp16 tensor accumulates
+    # (and therefore saturates at 65504) in fp16 -- reduce this ridge adjoint in fp32.
+    tmp = ridge_ratio * tl.sum(dq.to(tl.float32) * x_out.to(tl.float32), axis=1)
+    # `fro` is the *raw* norm; the forward floored it before forming lambda, and
+    # max(fro, c) has zero derivative below c -- so the whole lambda adjoint must
+    # vanish on the floored rows (previously the un-floored formula was applied
+    # there, amplified by 1 / FLOOR_FRO).
+    tmp = tl.where(fro >= FLOOR_FRO, tmp, 0.0)
     dgkk += tmp * fro
 
     w = 2 * tmp / fro
@@ -289,6 +297,7 @@ def chunk_bwd_dk_gating(
     gkk: Tensor,
     chunk_size: int = 64,
     ridge_ratio: float = 0.02,
+    fro_floor: float = 1e-2,
     cu_seqlens: Tensor | None = None,
     chunk_indices: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
@@ -358,6 +367,7 @@ def chunk_bwd_dk_gating(
         BD=BD,
         chunk_size=chunk_size,
         ridge_ratio=ridge_ratio,
+        FLOOR_FRO=fro_floor,
     )
 
     dk2 = torch.empty_like(k)
