@@ -587,6 +587,7 @@ class GatedKalmaNet(nn.Module):
                 o = o.unsqueeze(0)  # [1, Lp, H, D]
 
             o = o.to(q)
+            o = o.to(torch.bfloat16)
 
         # Update cache
         update_layer_cache(
