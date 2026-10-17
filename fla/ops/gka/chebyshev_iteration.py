@@ -280,14 +280,17 @@ def chebyshev_iteration_fro_forward_kernel(
         )
 
 
-@triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'USE_GAIN': lambda args: args['gain_ptr'] is not None,
+})
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [1, 2, 4, 8]
         for num_stages in [1, 2, 3, 4]
     ],
-    key=["D", "IS_VARLEN"],
+    key=["D", "IS_VARLEN", "USE_GAIN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chebyshev_iteration_fro_gating_forward_kernel(
@@ -296,6 +299,8 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     k_ptr,
     q_ptr,
     gkk_ptr,
+    gain_ptr,
+    gain_mom_ptr,
     # output:
     x_out_ptr,
     fro_ptr,
@@ -312,9 +317,14 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     ridge_ratio: tl.constexpr,
     load_fro: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_GAIN: tl.constexpr,
 ):
     """
     Chebyshev iteration with gating and adaptive ridge strength.
+
+    ``gain_ptr`` / ``gain_mom_ptr`` point at ``[H, num_iter]`` fp32 tables of
+    learned multipliers on the step and on the momentum coefficient; with
+    ``USE_GAIN == 0`` the iteration is bit-identical to plain Chebyshev.
 
     Like chebyshev_iteration_fro_forward_kernel but applies exponential gating
     (exp2) to key interactions for temporal decay, consuming `gkk` in log2 space.
@@ -357,6 +367,10 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     m_d = o_d < D
     m_tk = m_t[:, None] & m_d[None, :]
     m_kk = m_d[:, None] & m_d[None, :]
+
+    if USE_GAIN:
+        gain_ptr += h_id * num_iter
+        gain_mom_ptr += h_id * num_iter
 
     gkk = tl.load(gkk_ptr + o_t * H, mask=m_t, other=0.0).to(tl.float32)
 
@@ -412,23 +426,51 @@ def chebyshev_iteration_fro_gating_forward_kernel(
     x = stepsize * q.to(tl.float32)
     omega = tl.full((chunk_size, 1), 2.0, dtype=tl.float32)
 
-    for _ in range(num_iter):
+    for i in range(num_iter):
+        # `omega` is ALWAYS the pure Chebyshev recursion; the learned tables only
+        # rescale the step and the momentum coefficient of the *same* three-term
+        # expression below.
+        #
+        # The reference form (fla/layers/gka.py::NeuralSolver, and
+        # exp/torch_solver.py::run_iteration) is
+        #
+        #     x <- x + w * s * (q - A x) + mom * (x - x_prev)
+        #
+        # i.e. the coefficient of `x` is ``1 + mom``, *not* ``w``.  Plain
+        # Chebyshev happens to satisfy ``1 + mom == w`` because its momentum is
+        # tied (``mom == w - 1``), but a learned `phi != 0` breaks that tie, so
+        # the x-coefficient has to be ``wk`` below.  ``wk`` reduces to exactly
+        # ``w`` when the tie holds (``mom - (w - 1) == 0.0`` *exactly* when
+        # ``gain_mom == 1``, because ``mom`` is computed as ``(w-1)*1.0``), so
+        # the untrained table and the whole ``USE_GAIN == 0`` path stay
+        # bit-identical to the original kernel.
         omega = 1.0 / (1.0 - rho_sq_4 * omega)
+
+        if USE_GAIN:
+            #     omega_eff_k = omega_k * gain[h, k]
+            #     mom_k       = (omega_eff_k - 1) * gain_mom[h, k]
+            w = omega * tl.load(gain_ptr + i)
+            mom = (w - 1.0) * tl.load(gain_mom_ptr + i)
+            wk = w + (mom - (w - 1.0))
+        else:
+            w = omega
+            mom = omega - 1.0
+            wk = w
 
         grad_and_x_prev = (
             stepsize
-            * omega
+            * w
             * (
                 tl.dot((x * exp_gkk).to(h_kk.dtype), h_kk)
                 + tl.dot((tl.dot(x.to(k.dtype), tl.trans(k)) * mask).to(k.dtype), k)
                 + ridge_strength * x
                 - q
             )
-            + (omega - 1) * x_prev
+            + mom * x_prev
         )
         x_prev = x
+        x = wk * x - grad_and_x_prev
 
-        x = omega * x - grad_and_x_prev
     # store results
     p_x_out = x_out_ptr + o_t[:, None] * (H * D) + o_d[None, :]
     tl.store(
@@ -459,6 +501,8 @@ def chebyshev_iteration_forward_triton(
     h0=None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    gain: torch.Tensor | None = None,
+    gain_mom: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Solves (H_t + λI)·x = q using Chebyshev iteration with chunked processing.
@@ -478,6 +522,10 @@ def chebyshev_iteration_forward_triton(
         output_final_state: Whether to return final h_kk state. Defaults to False
         cu_seqlens: Cumulative sequence lengths with shape [N+1] for varlen inputs, or None
         chunk_indices: Chunk indices prepared from cu_seqlens, computed if None
+        gain: optional ``[H, num_iter]`` fp32 multipliers on the Chebyshev step,
+            one per (head, iteration); ``None`` = plain Chebyshev
+        gain_mom: optional ``[H, num_iter]`` fp32 multipliers on the momentum
+            coefficient ``(omega - 1)``
 
     Returns:
         x_out: Solution tensor with shape [B, L, H, D]
@@ -511,6 +559,13 @@ def chebyshev_iteration_forward_triton(
 
     x_out = torch.empty_like(q)
 
+    assert (gain is None) == (gain_mom is None), \
+        "gain and gain_mom must be given together"
+    if gain is not None:
+        assert gkk is not None, "learned gains are only supported with gating"
+        assert gain.shape == (H, num_iter) and gain_mom.shape == (H, num_iter), \
+            f"gain tables must be [H, num_iter] = [{H}, {num_iter}], got {tuple(gain.shape)}"
+
     if gkk is None:
         chebyshev_iteration_fro_forward_kernel[grid](
             # inputs:
@@ -540,6 +595,8 @@ def chebyshev_iteration_forward_triton(
             k_ptr=k,
             q_ptr=q,
             gkk_ptr=gkk,
+            gain_ptr=gain,
+            gain_mom_ptr=gain_mom,
             # output:
             x_out_ptr=x_out,
             fro_ptr=fro,  # omega_last,
@@ -582,6 +639,8 @@ class ChebyshevIteration(torch.autograd.Function):
         chunk_size: int = 64,
         cu_seqlens: torch.LongTensor | None = None,
         cu_seqlens_cpu: torch.LongTensor | None = None,
+        gain: torch.Tensor | None = None,
+        gain_mom: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, T, H, D = q.shape
         fro = torch.empty((B, T, H), dtype=torch.float32).to(q.device)
@@ -602,7 +661,7 @@ class ChebyshevIteration(torch.autograd.Function):
                 chunk_indices=chunk_indices,
             )
 
-        x_out, fro, _, h_kk_final = chebyshev_iteration_forward_triton(
+        x_out, fro, h_kk, h_kk_final = chebyshev_iteration_forward_triton(
             k,
             q,
             gkk,
@@ -615,31 +674,41 @@ class ChebyshevIteration(torch.autograd.Function):
             h0=h0,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            gain=gain,
+            gain_mom=gain_mom,
         )
 
         ctx.save_for_backward(k, x_out, fro, gkk, h0, chunk_indices)
+        # The backward solves the transposed system with the *same* operator, so
+        # it must use the same coefficients.  detach(): the tables are learned
+        # by the auxiliary loss inside fla/layers/gka.py, not through the
+        # kernel's (implicit-differentiation) backward.
+        ctx.gain = None if gain is None else gain.detach()
+        ctx.gain_mom = None if gain_mom is None else gain_mom.detach()
         ctx.num_iter = num_iter
         ctx.chunk_size = chunk_size
         ctx.ridge_ratio = ridge_ratio
         ctx.bp_lambda = bp_lambda
         ctx.cu_seqlens = cu_seqlens
 
-        return x_out, h_kk_final
+        return x_out, h_kk, h_kk_final
 
     @staticmethod
     def backward(
-        ctx, dx_out: torch.Tensor, d_kk_final: torch.Tensor | None = None
+        ctx, dx_out: torch.Tensor, d_h_kk: torch.Tensor | None = None, d_kk_final: torch.Tensor | None = None
     ) -> tuple[
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        None,
-        None,
-        None,
-        torch.Tensor | None,
-        None,
-        None,
-        None,
+        torch.Tensor | None,   # dk
+        torch.Tensor | None,   # dq
+        torch.Tensor | None,   # dgk
+        None,                  # num_iter
+        None,                  # ridge_ratio
+        None,                  # bp_lambda
+        torch.Tensor | None,   # dh0
+        None,                  # chunk_size
+        None,                  # cu_seqlens
+        None,                  # cu_seqlens_cpu
+        None,                  # gain      (trained by the aux loss, not here)
+        None,                  # gain_mom
     ]:
         k, x_out, fro, gkk, h0, chunk_indices = ctx.saved_tensors
         num_iter = ctx.num_iter
@@ -661,6 +730,8 @@ class ChebyshevIteration(torch.autograd.Function):
             h0=h0,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            gain=ctx.gain,
+            gain_mom=ctx.gain_mom,
         )
 
         h_kk_final = None
@@ -726,4 +797,4 @@ class ChebyshevIteration(torch.autograd.Function):
                     cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
                 )
 
-        return dk, dq, dgk, None, None, None, dh0, None, None, None
+        return dk, dq, dgk, None, None, None, dh0, None, None, None, None, None

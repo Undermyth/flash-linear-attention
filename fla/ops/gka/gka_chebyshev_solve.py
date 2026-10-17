@@ -75,7 +75,8 @@ RCP_LN2_CONST = tl.constexpr(RCP_LN2)
 
 @torch.compiler.disable
 def latent_chebyshev(
-    k, q, ridge_strength, num_iter, solver_type, bp_lambda, gk, chunk_size, cu_seqlens, cu_seqlens_cpu
+    k, q, ridge_strength, num_iter, solver_type, bp_lambda, gk, chunk_size,
+    cu_seqlens, cu_seqlens_cpu, solver_gain=None, solver_gain_mom=None,
 ):
     """
     Dispatcher for ridge regression solvers: (H_t + λI)·x_t = q_t.
@@ -99,14 +100,14 @@ def latent_chebyshev(
         kk_final: Final key-key covariance H_T with shape [N, H, D, D]
     """
     if solver_type == "chebyshev":
-        x, kk_final = ChebyshevIteration.apply(
+        x, h_kk, kk_final = ChebyshevIteration.apply(
             k, q, gk, num_iter, ridge_strength, bp_lambda, None, chunk_size,
-            cu_seqlens, cu_seqlens_cpu,
+            cu_seqlens, cu_seqlens_cpu, solver_gain, solver_gain_mom,
         )
     else:
         raise ValueError(f"Unknown GKA solver type: {solver_type}")
 
-    return x, kk_final
+    return x, h_kk, kk_final
 
 
 def gka_chebyshev_gla(
@@ -124,9 +125,15 @@ def gka_chebyshev_gla(
     chunk_size: int = 64,
     cu_seqlens: torch.LongTensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
+    solver_gain: torch.Tensor | None = None,
+    solver_gain_mom: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     GKA Chebyshev solver for parallel training.
+
+    ``solver_gain`` / ``solver_gain_mom`` are optional ``[H, num_iter]`` tables of
+    learned multipliers on the Chebyshev step and on its momentum coefficient
+    (see ``NeuralSolver`` in fla/layers/gka.py).  ``None`` = plain Chebyshev.
 
     Solves the ridge regression problem (H_t + λI)·x_t = q_t at each timestep,
     then computes output via GLA recurrence. Processes entire sequences in parallel.
@@ -167,9 +174,9 @@ def gka_chebyshev_gla(
 
     if num_iter > 0:
         # q_ solves (H_t + λI) · q_ = q_t
-        q_, kk_final = latent_chebyshev(
+        q_, h_kk, kk_final = latent_chebyshev(
             k, q, ridge_strength, num_iter, solver_type, bp_lambda, gk, chunk_size,
-            cu_seqlens, cu_seqlens_cpu,
+            cu_seqlens, cu_seqlens_cpu, solver_gain, solver_gain_mom,
         )
 
         q = q + alpha[..., None] * (q_ - q)  # Equivalent to ⍺q_ + (1-⍺)q
@@ -181,7 +188,7 @@ def gka_chebyshev_gla(
         cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
     )
 
-    return o, kk_final, kv_final
+    return o, h_kk, kk_final, kv_final
 
 
 @triton.heuristics({
