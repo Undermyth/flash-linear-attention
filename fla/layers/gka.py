@@ -620,7 +620,11 @@ class GatedKalmaNet(nn.Module):
                     # tables handed to the Triton kernel below are detached, so
                     # the LM loss cannot push a (wrong) gradient through the
                     # kernel's implicit-differentiation backward.
-                    solver_loss, logs = self.solver(chunk_kk, k, q, gk, alpha)
+                    # `cu_seqlens` makes the reference solve follow the chunk
+                    # boundaries of the packed sequences, exactly as the kernel does.
+                    solver_loss, logs = self.solver(
+                        chunk_kk, k, q, gk, alpha, cu_seqlens=cu_seqlens,
+                    )
                     self.solver_residuals = logs
                 # o: [B_sp, Lp, H, D]
                 # chunk_kk: [B, C, H, D, D]
@@ -642,6 +646,8 @@ class GatedKalmaNet(nn.Module):
                     prev_h_kk=last_h_kk,
                     prev_h_kv=last_h_kv,
                     cu_seqlens=cu_seqlens,
+                    solver_gain=None if self.solver is None else self.solver.gain(),
+                    solver_gain_mom=None if self.solver is None else self.solver.gain_mom(),
                 )
                 # o: [B_sp, Lp, H, D] ([1, N, H, D] when the inputs are packed)
                 # h_kk: [N, H, D, D] (N = B, or the number of packed sequences)
@@ -832,39 +838,96 @@ class NeuralSolver(nn.Module):
         return out
 
     # -- forward = the training loss ---------------------------------------
-    def forward(self, h0, k, q, gk=None, alpha=None):
+    def forward(self, h0, k, q, gk=None, alpha=None, cu_seqlens=None, chunk_indices=None):
         """``h0``: ``[B, NC, H, D, D]`` chunk-start kk states (bf16).
 
         ``k``/``q``: ``[B, T, H, D]``; ``gk``: ``[B, T, H]`` forget gate of the
         kk covariance (``None`` = no gating); ``alpha``: ``[B, T, H]`` output
         gate.  Returns ``(loss, logs)``.
+
+        With ``cu_seqlens`` (``[N+1]``, batch size 1) the tokens are a pack of
+        ``N`` ragged sequences: the chunk boundaries follow the packed
+        sequences, ``h0`` holds the ``sum_n cdiv(len_n, C)`` chunk states in the
+        order the Triton kernels index them, and the tail of every sequence is
+        zero-padded exactly as the kernels load it.
         """
         B, T, H, D = k.shape
         C = self.chunk_size
-        NC = T // C
-        M = B * NC * H
         dev = k.device
 
+        from fla.ops.utils import chunk_local_cumsum
         if gk is None:
             gt = torch.zeros(B, T, H, device=dev, dtype=torch.float32)
         else:
-            from fla.ops.utils import chunk_local_cumsum
-            gt = chunk_local_cumsum(gk, chunk_size=C, scale=RCP_LN2)
+            gt = chunk_local_cumsum(
+                gk, chunk_size=C, scale=RCP_LN2,
+                cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+            )
 
-        kt = _tile(k, C, (D,))
-        qt = _tile(q, C, (D,))
-        gt = _tile(gt, C)
-        h0t = h0.reshape(M, D, D).contiguous()
-        at = None if alpha is None else _tile(alpha.float(), C)
+        if cu_seqlens is None:
+            NC = T // C
+            M = B * NC * H
+            kt = _tile(k, C, (D,))
+            qt = _tile(q, C, (D,))
+            gt = _tile(gt, C)
+            h0t = h0.reshape(M, D, D).contiguous()
+            at = None if alpha is None else _tile(alpha.float(), C)
+            valid = None
+        else:
+            if B != 1:
+                raise ValueError(
+                    "cu_seqlens requires a batch size of 1, "
+                    f"got {B}; flatten the variable-length inputs first",
+                )
+            if chunk_indices is None:
+                from fla.ops.utils import prepare_chunk_indices
+                chunk_indices = prepare_chunk_indices(cu_seqlens, C)
+            NG = chunk_indices.shape[0]
+            M = NG * H
+            # (sequence, in-sequence chunk) of every chunk, in the flat order
+            # `chunk_fwd_h` stored its states, i.e. m = i_chunk * H + h.
+            seg = chunk_indices[:, 0].long()
+            cid = chunk_indices[:, 1].long()
+            rows = cid[:, None] * C + torch.arange(C, device=dev)
+            valid = rows < (cu_seqlens[1:] - cu_seqlens[:-1])[seg][:, None]
+            pos = (cu_seqlens[seg][:, None] + rows).clamp(0, T - 1)
+
+            def _tile_varlen(t):
+                # [1, T, H, *E] -> [NG*H, C, *E]
+                x = t[0][pos]
+                x = x.permute(0, 2, 1, *range(3, x.dim()))
+                return x.reshape(M, C, *t.shape[3:])
+
+            # a chunk's tail past the sequence end is loaded as zero by the
+            # kernels, so it must be zeroed here too: the tokens it would
+            # otherwise pick up belong to the *next* packed sequence.
+            valid = valid[:, None, :].expand(NG, H, C).reshape(M, C)
+            kt = _tile_varlen(k) * valid[..., None]
+            qt = _tile_varlen(q) * valid[..., None]
+            at = None if alpha is None else _tile_varlen(alpha.float()) * valid
+            # The kernel loads the dead tail as `gt = 0`, which would make the
+            # in-chunk recurrence of the exact solve *amplify* the state across
+            # the boundary by `2 ** -gt_last` (inf for long chunks with small
+            # gates, and then nan through the loss).  Carrying the last live `gt`
+            # freezes the recurrence instead; those rows solve
+            # `(H + lam I) x = 0` either way, so the loss is unchanged.
+            gt = _tile_varlen(gt)
+            last = torch.cummax(
+                torch.where(valid, torch.arange(C, device=dev)[None, :], 0), dim=1,
+            ).values
+            gt = torch.where(valid, gt, gt.gather(1, last))
+            h0t = h0.reshape(M, D, D).contiguous()
 
         exp_gkk = torch.exp2(gt).unsqueeze(-1)                       # [M,C,1]
         idx = torch.arange(C, device=dev)
         causal = idx[:, None] >= idx[None, :]
+        if valid is not None:
+            causal = causal[None] & (valid[:, :, None] & valid[:, None, :])
         if gk is None:
             mask = causal.to(torch.bfloat16).expand(M, C, C)
         else:
             m = torch.exp2(gt[:, :, None] - gt[:, None, :])
-            mask = torch.where(causal[None], m, torch.zeros_like(m)).to(torch.bfloat16)
+            mask = torch.where(causal, m, torch.zeros_like(m)).to(torch.bfloat16)
 
         # ---- the kernel's own ||H_t||_F algebra (bf16 casts included) -----
         gram = _kdot(kt, kt.transpose(1, 2))

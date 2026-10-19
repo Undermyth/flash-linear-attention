@@ -13,6 +13,8 @@ def _chebyshev_solve(
     q: torch.Tensor,
     ridge_strength: float,
     num_iter: int,
+    gain: torch.Tensor | None = None,
+    gain_mom: torch.Tensor | None = None,
 ) -> torch.Tensor:
     r"""
     Solve (H + λI)·x = q, with λ = ridge_strength·||H||_F, by Chebyshev iteration, following the
@@ -27,11 +29,19 @@ def _chebyshev_solve(
             Ridge strength as a fraction of the Frobenius norm of `h_kk`.
         num_iter (int):
             Number of Chebyshev iterations.
+        gain (torch.Tensor, Optional):
+            Learned multipliers on the step, of shape `[..., num_iter]` (broadcastable to the
+            leading dimensions of `h_kk`). Default: `None`.
+        gain_mom (torch.Tensor, Optional):
+            Learned multipliers on the momentum coefficient, of the same shape as `gain`.
+            Default: `None`.
 
     Returns:
         x (torch.Tensor):
             Solutions of shape `[..., D]`.
     """
+    if gain is not None:
+        assert gain_mom is not None, "gain and gain_mom must be given together"
     fro = h_kk.norm(dim=(-2, -1))
     lamb = ridge_strength * fro
     # the spectral radius is bounded by ||H||_F, and the ridge shifts the lower bound to λ itself
@@ -42,12 +52,17 @@ def _chebyshev_solve(
 
     x = stepsize * q
     x_prev = torch.zeros_like(x)
-    for _ in range(num_iter):
+    for i in range(num_iter):
         omega = 1 / (1 - rho_sq_4 * omega)
+        # `omega` stays the pure Chebyshev recursion; the learned tables only rescale the
+        # step and the momentum coefficient, and the coefficient of `x` is `1 + mom`.
+        w = omega if gain is None else omega * gain[..., i].unsqueeze(-1)
+        mom = (w - 1) if gain is None else (w - 1) * gain_mom[..., i].unsqueeze(-1)
+        wk = w if gain is None else w + (mom - (w - 1))
         grad = (x.unsqueeze(-1) * h_kk).sum(-2) + lamb.unsqueeze(-1) * x - q
-        grad_and_x_prev = stepsize * omega * grad + (omega - 1) * x_prev
+        grad_and_x_prev = stepsize * w * grad + mom * x_prev
         x_prev = x
-        x = omega * x - grad_and_x_prev
+        x = wk * x - grad_and_x_prev
     return x
 
 
@@ -63,6 +78,8 @@ def naive_gka_decoding_one_step(
     num_iter: int = 30,
     prev_h_kk: torch.Tensor | None = None,
     prev_h_kv: torch.Tensor | None = None,
+    gain: torch.Tensor | None = None,
+    gain_mom: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     r"""
     Naive reference for `torch_decoding_one_step`: one GKA decoding step, where the ridge problem
@@ -92,6 +109,12 @@ def naive_gka_decoding_one_step(
             Key-key covariance carried over from previous steps, of shape `[B, H, D, D]`. Default: `None`.
         prev_h_kv (torch.Tensor, Optional):
             Key-value state carried over from previous steps, of shape `[B, H, D, DV]`. Default: `None`.
+        gain (torch.Tensor, Optional):
+            Learned multipliers on the Chebyshev step, of shape `[H, num_iter]`, shared by the
+            batch. Default: `None`.
+        gain_mom (torch.Tensor, Optional):
+            Learned multipliers on the momentum coefficient, of the same shape as `gain`.
+            Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -120,7 +143,11 @@ def naive_gka_decoding_one_step(
     h_kv = h_kv + k_i.unsqueeze(-1) * v_i.unsqueeze(-2)
 
     if num_iter > 0:
-        x = _chebyshev_solve(h_kk, q_i, ridge_strength, num_iter)
+        assert (gain is None) == (gain_mom is None), "gain and gain_mom must be given together"
+        if gain is not None:
+            gain = gain.unsqueeze(0).expand(B, -1, -1)
+            gain_mom = gain_mom.unsqueeze(0).expand(B, -1, -1)
+        x = _chebyshev_solve(h_kk, q_i, ridge_strength, num_iter, gain, gain_mom)
         q_star = q_i + alpha[:, 0].unsqueeze(-1) * (x - q_i)
     else:
         h_kk = None

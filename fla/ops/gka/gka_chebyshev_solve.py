@@ -193,6 +193,7 @@ def gka_chebyshev_gla(
 
 @triton.heuristics({
     "USE_GK": lambda args: args["gk_ptr"] is not None,
+    "USE_GAIN": lambda args: args["gain_ptr"] is not None,
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
 @triton.jit(do_not_specialize=["T"])
@@ -202,6 +203,8 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     k_ptr,
     q_ptr,
     gk_ptr,
+    gain_ptr,
+    gain_mom_ptr,
     # output:
     x_out_ptr,
     h_kk_ptr,
@@ -214,6 +217,7 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     num_iter: tl.constexpr,
     ridge_ratio: tl.constexpr,
     USE_GK: tl.constexpr,
+    USE_GAIN: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     """
@@ -222,6 +226,12 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     Updates key-key covariance h_kk from previous state, then solves
     (h_kk + λI)·x = q using Chebyshev iteration. Optimized for autoregressive
     decoding where one token is processed at a time.
+
+    ``gain_ptr`` / ``gain_mom_ptr`` point at ``[H, num_iter]`` fp32 tables of
+    learned multipliers on the step and on the momentum coefficient; with
+    ``USE_GAIN == 0`` the iteration is bit-identical to plain Chebyshev.  The
+    tables are indexed by head only, so they are shared by all batch elements
+    (and by all packed sequences under varlen).
 
     Grid: (B, H) - one thread block per batch element and head.
     For varlen inputs, dim 0 enumerates the `N` packed sequences, each holding a
@@ -260,6 +270,11 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     else:
         gk_exp = 1.0
 
+    if USE_GAIN:
+        # the tables are laid out as [H, num_iter]
+        gain_ptr += h_id * num_iter
+        gain_mom_ptr += h_id * num_iter
+
     h_kk_ = h_kk * gk_exp + k[:, None] * k[None, :]
     fro = tl.sqrt(tl.sum(h_kk_ * h_kk_))
 
@@ -273,24 +288,42 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     x = stepsize * q.to(tl.float32)
     omega = 2.0
 
-    for _ in range(num_iter):
+    for i in range(num_iter):
+        # `omega` is ALWAYS the pure Chebyshev recursion; the learned tables only
+        # rescale the step and the momentum coefficient, exactly as in the chunked
+        # training kernel (`chebyshev_iteration_fro_gating_forward_kernel`):
+        #
+        #     w = omega * gain[h, i] ;  mom = (w - 1) * gain_mom[h, i]
+        #
+        # and the coefficient of `x` is `1 + mom`, which is `w` only when the
+        # momentum is tied (`gain_mom == 1`), so the untrained table and the whole
+        # `USE_GAIN == 0` path stay bit-identical to the original kernel.
         omega = 1.0 / (1.0 - rho_sq_4 * omega)
+
+        if USE_GAIN:
+            w = omega * tl.load(gain_ptr + i)
+            mom = (w - 1.0) * tl.load(gain_mom_ptr + i)
+            wk = w + (mom - (w - 1.0))
+        else:
+            w = omega
+            mom = omega - 1.0
+            wk = w
 
         grad_and_x_prev = (
             stepsize
-            * omega
+            * w
             * (
                 tl.sum(h_kk * (x * gk_exp)[:, None], axis=0)
                 + tl.sum(k[:, None] * k[None, :] * x[:, None], axis=0)
                 + ridge_strength * x
                 - q
             )
-            + (omega - 1) * x_prev
+            + mom * x_prev
         )
 
         x_prev = x
 
-        x = omega * x - grad_and_x_prev
+        x = wk * x - grad_and_x_prev
 
     tl.store(x_out_ptr, x.to(x_out_ptr.dtype.element_ty))
 
@@ -311,6 +344,8 @@ def chebyshev_iteration_forward_triton_inference(
     num_iter: int = 30,
     ridge_ratio: float = 0.1,
     cu_seqlens: torch.LongTensor | None = None,
+    gain: torch.Tensor | None = None,
+    gain_mom: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Solves (h_kk + λI)·x = q for single-step inference using Triton-optimized Chebyshev iteration.
@@ -327,6 +362,11 @@ def chebyshev_iteration_forward_triton_inference(
         ridge_ratio: Base regularization parameter (scaled by ||h_kk||_F). Defaults to 0.1
         cu_seqlens: Cumulative sequence lengths with shape [N+1] for varlen inputs, or None.
             Each packed sequence holds exactly one token. Defaults to None
+        gain: Optional ``[H, num_iter]`` fp32 multipliers on the Chebyshev step, one per
+            (head, iteration); ``None`` = plain Chebyshev. Shared by all batch elements
+            and by all packed sequences.
+        gain_mom: Optional ``[H, num_iter]`` fp32 multipliers on the momentum coefficient
+            ``(omega - 1)``, given together with ``gain``.
 
     Returns:
         x_out: Solution vector with shape [B, 1, H, D]
@@ -334,6 +374,13 @@ def chebyshev_iteration_forward_triton_inference(
     """
     B, L, H, D = q.shape
     N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
+
+    assert (gain is None) == (gain_mom is None), \
+        "gain and gain_mom must be given together"
+    if gain is not None:
+        assert gain.shape == (H, num_iter) and gain_mom.shape == (H, num_iter), \
+            f"gain tables must be [H, num_iter] = [{H}, {num_iter}], " \
+            f"got {tuple(gain.shape)} and {tuple(gain_mom.shape)}"
 
     h_kk = torch.empty_like(prev_h_kk)
 
@@ -347,6 +394,8 @@ def chebyshev_iteration_forward_triton_inference(
         k,
         q,
         gk,
+        gain,
+        gain_mom,
         # output:
         x_out,
         h_kk,
@@ -378,6 +427,8 @@ def torch_decoding_one_step(
     prev_h_kk: torch.Tensor,
     prev_h_kv: torch.Tensor,
     cu_seqlens: torch.LongTensor | None = None,
+    solver_gain: torch.Tensor | None = None,
+    solver_gain_mom: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Single-step GKA inference with state management for autoregressive decoding.
@@ -402,6 +453,11 @@ def torch_decoding_one_step(
             decoding, consistent with the FlashAttention API. `B` is expected to be 1 then, and
             every packed sequence contributes exactly one token, so the packed length is `N`.
             Defaults to None.
+        solver_gain: Optional ``[H, num_iter]`` fp32 table of learned multipliers on the
+            Chebyshev step, matching the one used by ``gka_chebyshev_gla`` during training
+            (see ``NeuralSolver`` in fla/layers/gka.py). ``None`` = plain Chebyshev.
+        solver_gain_mom: Optional ``[H, num_iter]`` fp32 table of learned multipliers on the
+            momentum coefficient ``(omega - 1)``, given together with ``solver_gain``.
 
     Returns:
         o: Output tensor with shape [B, 1, H, D]
@@ -445,7 +501,7 @@ def torch_decoding_one_step(
         if solver_type == "chebyshev":
             q_, h_kk = chebyshev_iteration_forward_triton_inference(
                 prev_h_kk, k, q_, gk, num_iter=num_iter, ridge_ratio=ridge_strength,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=cu_seqlens, gain=solver_gain, gain_mom=solver_gain_mom,
             )
         else:
             raise ValueError(f"Unknown GKA solver type: {solver_type}")
