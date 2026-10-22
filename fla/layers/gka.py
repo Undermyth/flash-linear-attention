@@ -190,6 +190,7 @@ class GatedKalmaNet(nn.Module):
         solver_steps: int = 20,
         solver_ckpts: tuple | None = None,
         solver_d_max: float = 1.5,
+        solver_diag: bool = False,
         solver_grad_checkpoint: bool = True,
         solver_max_tiles: int = 1024,
         **kwargs,
@@ -318,6 +319,8 @@ class GatedKalmaNet(nn.Module):
                 chunk_size=chunk_size,
                 ckpts=solver_ckpts,
                 d_max=solver_d_max,
+                head_dim=self.head_dim,
+                diag=solver_diag,
                 grad_checkpoint=solver_grad_checkpoint,
                 max_tiles=solver_max_tiles,
             )
@@ -612,6 +615,7 @@ class GatedKalmaNet(nn.Module):
                     cu_seqlens=cu_seqlens,
                     solver_gain=None if self.solver is None else self.solver.gain(),
                     solver_gain_mom=None if self.solver is None else self.solver.gain_mom(),
+                    solver_gain_diag=None if self.solver is None else self.solver.gain_diag(),
                 )
                 solver_loss = None
                 if self.solver is not None and self.training:
@@ -648,6 +652,7 @@ class GatedKalmaNet(nn.Module):
                     cu_seqlens=cu_seqlens,
                     solver_gain=None if self.solver is None else self.solver.gain(),
                     solver_gain_mom=None if self.solver is None else self.solver.gain_mom(),
+                    solver_gain_diag=None if self.solver is None else self.solver.gain_diag(),
                 )
                 # o: [B_sp, Lp, H, D] ([1, N, H, D] when the inputs are packed)
                 # h_kk: [N, H, D, D] (N = B, or the number of packed sequences)
@@ -776,6 +781,8 @@ class NeuralSolver(nn.Module):
         chunk_size: int = 64,
         ckpts: tuple | None = None,
         d_max: float = 1.5,
+        head_dim: int | None = None,
+        diag: bool = False,
         grad_checkpoint: bool = True,
         max_tiles: int = 1024,
         eps: float = 1e-12,
@@ -786,6 +793,8 @@ class NeuralSolver(nn.Module):
         self.ridge_strength = float(ridge_strength)
         self.chunk_size = int(chunk_size)
         self.d_max = float(d_max)
+        self.head_dim = int(head_dim) if head_dim is not None else 128
+        self.diag = bool(diag)
         self.grad_checkpoint = bool(grad_checkpoint)
         self.max_tiles = int(max_tiles)
         self.eps = float(eps)
@@ -798,16 +807,31 @@ class NeuralSolver(nn.Module):
         # theta / phi: see the class docstring.  Zero == exactly Chebyshev.
         self.theta = nn.Parameter(torch.zeros(num_heads, num_steps))
         self.phi = nn.Parameter(torch.zeros(num_heads, num_steps))
+        # diag (exp2 beta1L): per-(head, step, channel) gain on the
+        # preconditioned residual; zero-init == exp1 behaviour (d_k == 1).  In
+        # diag mode the scalar theta arm above is absorbed into `u` and is no
+        # longer read (see forward()); `phi` keeps its scalar role.
+        if self.diag:
+            self.u = nn.Parameter(torch.zeros(num_heads, num_steps, self.head_dim))
 
     # -- tables handed to the Triton kernel (detached: no gradient through the
-    #    kernel, the aux loss below is the only training path for theta/phi)
-    def gain(self) -> torch.Tensor:
+    #    kernel, the aux loss below is the only training path for theta/phi/u)
+    def gain(self) -> torch.Tensor | None:
+        # In diag mode the scalar theta arm is absorbed into `u`, so the
+        #scalar table is *not* passed to the kernel (the kernel asserts this).
         with torch.no_grad():
+            if self.diag:
+                return None
             return torch.exp(self.d_max * torch.tanh(self.theta))
 
     def gain_mom(self) -> torch.Tensor:
         with torch.no_grad():
             return torch.exp(self.phi)
+
+    def gain_diag(self) -> torch.Tensor | None:
+        with torch.no_grad():
+            return None if not self.diag else torch.exp(
+                self.d_max * torch.tanh(self.u))
 
     # -- operator / reference solve ---------------------------------------
     @torch.no_grad()
@@ -951,10 +975,34 @@ class NeuralSolver(nn.Module):
             seq.append(om)
         base = torch.stack(seq, dim=-1)                              # [M,C,K]
         hid = torch.arange(M, device=dev) % H
-        g_th = torch.exp(self.d_max * torch.tanh(self.theta))[hid][:, None, :]
-        g_ph = torch.exp(self.phi)[hid][:, None, :]
-        w = base * g_th
-        mom = (w - 1.0) * g_ph
+        if self.diag:
+            # exp2 beta1L: per-(head, step, channel) gain on the preconditioned
+            # residual.  The scalar theta arm is absorbed into `u` (zero-init
+            # == exp1 behaviour); `phi` keeps its scalar momentum role, and the
+            # momentum coefficient follows the offline harness exactly:
+            #     mom = (omega * gain_diag - 1) * exp(phi)
+            # w/mom are assembled per *step* inside `iterate` — a full
+            # [M, C, K, D] materialization would cost ~2 GB per forward at the
+            # trunk shape (this OOMed the 24-layer e2e smoke).
+            g_d = torch.exp(
+                self.d_max * torch.tanh(self.u)
+            )[hid][:, None, :, :]                                   # [M,1,K,D]
+            g_ph = torch.exp(self.phi)[hid][:, None, :]              # [M,1,K]
+            trainable = self.u.requires_grad or self.phi.requires_grad
+
+            def wz(kk):
+                # base [M,C,K]; g_d [M,1,K,D]; g_ph [M,1,K]
+                w = base[:, :, kk].unsqueeze(-1) * g_d[:, :, kk]     # [M,C,D]
+                return w, (w - 1.0) * g_ph[:, None, :, kk]           # ×[M,1,1]
+        else:
+            g_th = torch.exp(self.d_max * torch.tanh(self.theta))[hid][:, None, :]
+            g_ph = torch.exp(self.phi)[hid][:, None, :]
+            w = base * g_th
+            mom = (w - 1.0) * g_ph                                   # [M,C,K] / [M,C,K]
+            trainable = self.theta.requires_grad or self.phi.requires_grad
+
+            def wz(kk):
+                return w[:, :, kk], mom[:, :, kk]
 
         # ---- the exact target (label, no grad) ---------------------------
         xstar = self._exact_solve(kt, h0t, gt, lam, qt, D, C, M)
@@ -969,24 +1017,26 @@ class NeuralSolver(nn.Module):
 
         x0 = step.unsqueeze(-1) * qf
 
-        def iterate(x, w, mom):
-            xprev = torch.zeros_like(x)
+        def iterate(x, xprev=None):
+            if xprev is None:
+                xprev = torch.zeros_like(x)
             out = []
             for kk in range(self.num_steps):
+                wk, mk = wz(kk)
+                wk = wk if wk.dim() == 3 else wk.unsqueeze(-1)
+                mk = mk if mk.dim() == 3 else mk.unsqueeze(-1)
                 r = qf - op(x)
-                xn = (x + w[:, :, kk].unsqueeze(-1) * step.unsqueeze(-1) * r
-                      + mom[:, :, kk].unsqueeze(-1) * (x - xprev))
+                xn = x + wk * step.unsqueeze(-1) * r + mk * (x - xprev)
                 xprev, x = x, xn
                 if (kk + 1) in self.ckpts:
                     out.append(x)
             return tuple(out)
 
-        if self.grad_checkpoint and torch.is_grad_enabled() and (
-                w.requires_grad or mom.requires_grad):
+        if self.grad_checkpoint and torch.is_grad_enabled() and trainable:
             hist = torch.utils.checkpoint.checkpoint(
-                iterate, x0, w, mom, use_reentrant=False)
+                iterate, x0, use_reentrant=False)
         else:
-            hist = iterate(x0, w, mom)
+            hist = iterate(x0)
         if torch.is_tensor(hist):
             hist = (hist,)
 

@@ -77,6 +77,7 @@ RCP_LN2_CONST = tl.constexpr(RCP_LN2)
 def latent_chebyshev(
     k, q, ridge_strength, num_iter, solver_type, bp_lambda, gk, chunk_size,
     cu_seqlens, cu_seqlens_cpu, solver_gain=None, solver_gain_mom=None,
+    solver_gain_diag=None,
 ):
     """
     Dispatcher for ridge regression solvers: (H_t + λI)·x_t = q_t.
@@ -103,6 +104,7 @@ def latent_chebyshev(
         x, h_kk, kk_final = ChebyshevIteration.apply(
             k, q, gk, num_iter, ridge_strength, bp_lambda, None, chunk_size,
             cu_seqlens, cu_seqlens_cpu, solver_gain, solver_gain_mom,
+            solver_gain_diag,
         )
     else:
         raise ValueError(f"Unknown GKA solver type: {solver_type}")
@@ -127,13 +129,18 @@ def gka_chebyshev_gla(
     cu_seqlens_cpu: torch.LongTensor | None = None,
     solver_gain: torch.Tensor | None = None,
     solver_gain_mom: torch.Tensor | None = None,
+    solver_gain_diag: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     GKA Chebyshev solver for parallel training.
 
     ``solver_gain`` / ``solver_gain_mom`` are optional ``[H, num_iter]`` tables of
     learned multipliers on the Chebyshev step and on its momentum coefficient
-    (see ``NeuralSolver`` in fla/layers/gka.py).  ``None`` = plain Chebyshev.
+    (see ``NeuralSolver`` in fla/layers/gka.py).  ``solver_gain_diag`` is an
+    optional ``[H, num_iter, D]`` table of per-channel multipliers (exp2
+    beta1L); it replaces the scalar step arm, so it requires
+    ``solver_gain=None`` and a ``solver_gain_mom`` table.  All ``None`` = plain
+    Chebyshev.
 
     Solves the ridge regression problem (H_t + λI)·x_t = q_t at each timestep,
     then computes output via GLA recurrence. Processes entire sequences in parallel.
@@ -177,6 +184,7 @@ def gka_chebyshev_gla(
         q_, h_kk, kk_final = latent_chebyshev(
             k, q, ridge_strength, num_iter, solver_type, bp_lambda, gk, chunk_size,
             cu_seqlens, cu_seqlens_cpu, solver_gain, solver_gain_mom,
+            solver_gain_diag,
         )
 
         q = q + alpha[..., None] * (q_ - q)  # Equivalent to ⍺q_ + (1-⍺)q
@@ -194,6 +202,7 @@ def gka_chebyshev_gla(
 @triton.heuristics({
     "USE_GK": lambda args: args["gk_ptr"] is not None,
     "USE_GAIN": lambda args: args["gain_ptr"] is not None,
+    "USE_GAIN_DIAG": lambda args: args["gain_diag_ptr"] is not None,
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
 @triton.jit(do_not_specialize=["T"])
@@ -205,6 +214,7 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     gk_ptr,
     gain_ptr,
     gain_mom_ptr,
+    gain_diag_ptr,
     # output:
     x_out_ptr,
     h_kk_ptr,
@@ -218,6 +228,7 @@ def chebyshev_iteration_fro_inference_forward_kernel(
     ridge_ratio: tl.constexpr,
     USE_GK: tl.constexpr,
     USE_GAIN: tl.constexpr,
+    USE_GAIN_DIAG: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     """
@@ -274,6 +285,10 @@ def chebyshev_iteration_fro_inference_forward_kernel(
         # the tables are laid out as [H, num_iter]
         gain_ptr += h_id * num_iter
         gain_mom_ptr += h_id * num_iter
+    if USE_GAIN_DIAG:
+        # the diag table is laid out as [H, num_iter, D] (exp2 beta1L)
+        gain_diag_ptr += h_id * num_iter * D
+        gain_mom_ptr += h_id * num_iter
 
     h_kk_ = h_kk * gk_exp + k[:, None] * k[None, :]
     fro = tl.sqrt(tl.sum(h_kk_ * h_kk_))
@@ -302,6 +317,15 @@ def chebyshev_iteration_fro_inference_forward_kernel(
 
         if USE_GAIN:
             w = omega * tl.load(gain_ptr + i)
+            mom = (w - 1.0) * tl.load(gain_mom_ptr + i)
+            wk = w + (mom - (w - 1.0))
+        elif USE_GAIN_DIAG:
+            # exp2 beta1L: per-channel gain replaces the scalar step arm; the
+            # momentum follows the offline harness
+            # (mom = (omega * gain_diag - 1) * gain_mom).  A table of exact
+            # ones reproduces the scalar path bit-for-bit.
+            d = tl.load(gain_diag_ptr + i * D + tl.arange(0, D))
+            w = omega * d
             mom = (w - 1.0) * tl.load(gain_mom_ptr + i)
             wk = w + (mom - (w - 1.0))
         else:
@@ -346,6 +370,7 @@ def chebyshev_iteration_forward_triton_inference(
     cu_seqlens: torch.LongTensor | None = None,
     gain: torch.Tensor | None = None,
     gain_mom: torch.Tensor | None = None,
+    gain_diag: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Solves (h_kk + λI)·x = q for single-step inference using Triton-optimized Chebyshev iteration.
@@ -367,6 +392,9 @@ def chebyshev_iteration_forward_triton_inference(
             and by all packed sequences.
         gain_mom: Optional ``[H, num_iter]`` fp32 multipliers on the momentum coefficient
             ``(omega - 1)``, given together with ``gain``.
+        gain_diag: Optional ``[H, num_iter, D]`` fp32 per-channel multipliers (exp2
+            beta1L) replacing the scalar step arm; requires ``gain=None`` and a
+            ``gain_mom`` table.
 
     Returns:
         x_out: Solution vector with shape [B, 1, H, D]
@@ -375,12 +403,16 @@ def chebyshev_iteration_forward_triton_inference(
     B, L, H, D = q.shape
     N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
 
-    assert (gain is None) == (gain_mom is None), \
-        "gain and gain_mom must be given together"
+    assert (gain is None) == (gain_mom is None) or (gain is None and gain_diag is not None), \
+        "gain and gain_mom must be given together; a diag table replaces the scalar step arm"
     if gain is not None:
         assert gain.shape == (H, num_iter) and gain_mom.shape == (H, num_iter), \
             f"gain tables must be [H, num_iter] = [{H}, {num_iter}], " \
             f"got {tuple(gain.shape)} and {tuple(gain_mom.shape)}"
+    if gain_diag is not None:
+        assert gain_mom is not None, "diag gain requires the scalar momentum table"
+        assert gain_diag.shape == (H, num_iter, D), \
+            f"gain_diag must be [H, num_iter, D] = [{H}, {num_iter}, {D}], got {tuple(gain_diag.shape)}"
 
     h_kk = torch.empty_like(prev_h_kk)
 
@@ -396,6 +428,7 @@ def chebyshev_iteration_forward_triton_inference(
         gk,
         gain,
         gain_mom,
+        gain_diag,
         # output:
         x_out,
         h_kk,
@@ -429,6 +462,7 @@ def torch_decoding_one_step(
     cu_seqlens: torch.LongTensor | None = None,
     solver_gain: torch.Tensor | None = None,
     solver_gain_mom: torch.Tensor | None = None,
+    solver_gain_diag: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Single-step GKA inference with state management for autoregressive decoding.
@@ -502,6 +536,7 @@ def torch_decoding_one_step(
             q_, h_kk = chebyshev_iteration_forward_triton_inference(
                 prev_h_kk, k, q_, gk, num_iter=num_iter, ridge_ratio=ridge_strength,
                 cu_seqlens=cu_seqlens, gain=solver_gain, gain_mom=solver_gain_mom,
+                gain_diag=solver_gain_diag,
             )
         else:
             raise ValueError(f"Unknown GKA solver type: {solver_type}")

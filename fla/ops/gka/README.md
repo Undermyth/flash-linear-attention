@@ -45,6 +45,22 @@ where $`\rho = (L - \mu)/(L + \mu)`$.
 The last iterate is used as $`\mathbf{x}_t`$.
 Unlike conjugate gradients, Chebyshev iteration needs no inner products, and the paper shows that it is more stable in low precision.
 
+## Learned schedule (NeuralSolver)
+
+The `NeuralSolver` module in `fla/layers/gka.py` wraps this fixed recursion with
+learned multiplier tables. Two supported shapes:
+
+- *scalar arms* (`exp1`, USE_GAIN): `gain`/`gain_mom` are `[H, num_iter]` fp32
+  tables; `gain = gain_mom = 1` reproduces plain Chebyshev bit-for-bit.
+- *per-channel gain* (`exp2` beta1L, USE_GAIN_DIAG): `gain_diag` is an
+  `[H, num_iter, D]` fp32 table that *replaces* the scalar step arm and is
+  applied elementwise to the preconditioned residual
+  $`d_k \odot (s\,\omega_k\,r)`$, zero extra matvec; the momentum coefficient
+  stays scalar (`(ω·d − 1)·exp(φ)`). A table of exact ones is bit-identical to
+  plain Chebyshev (the idle multiplication by 1.0 is exact). The table is
+  trained by the auxiliary loss in `NeuralSolver.forward` (torch side), while
+  the Triton kernel's backward reuses the same tables detached.
+
 ## Chunk-wise computation
 
 The chunked kernel computes $`\mathbf{H}_t\boldsymbol{\xi}_{n-1}`$ and $`\lVert\mathbf{H}_t\rVert_F`$ without materializing $`\mathbf{H}_t`$.
