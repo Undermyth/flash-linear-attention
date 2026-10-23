@@ -67,6 +67,7 @@ if TYPE_CHECKING:
 #     recompute_with_initial_states,
 # )
 
+from fla.ops.gka import debug_capture
 from fla.ops.gka.gka_chebyshev_solve import gka_chebyshev_gla, torch_decoding_one_step
 
 # if TYPE_CHECKING:
@@ -531,6 +532,10 @@ class GatedKalmaNet(nn.Module):
 
         gk = g if self.use_forgetting_gate_kk else None
 
+        # The solver inputs are exposed here so that offline tooling can capture them
+        # (`q`: normalized queries, `k`: beta-gated keys, `gk`: log-decays of the key-key state).
+        # DETECTOR_solver_inputs
+
         # Backward kernels require sequence length to be divisible by chunk size;
         # the varlen kernels instead mask the ragged chunk tails.
         if gk is None and self.training and cu_seqlens is None:
@@ -560,6 +565,14 @@ class GatedKalmaNet(nn.Module):
                 # o: [B_sp, Lp, H, D]
                 # h_kk: [N, H, D, D] (N = B, or the number of packed sequences)
                 # h_kv: [N, H, D, D]
+                # Expose the solver internals for offline analysis: the chunk-level `H`
+                # snapshots, the Chebyshev iterate and the per-position Frobenius norms.
+                # The capture channel is disabled by default, so these stay `None` in training.
+                gka_debug = debug_capture.take_last()
+                h_kk_chunks = gka_debug.get("h_kk_chunks")  # DETECTOR_h_kk_chunks
+                x_solver = gka_debug.get("x_out")  # DETECTOR_x_solver
+                fro_solver = gka_debug.get("fro")  # DETECTOR_fro_solver
+                gkk_solver = gka_debug.get("gkk")  # DETECTOR_gkk_solver
         else:
             with torch.cuda.device(q.device):
                 o, h_kk, h_kv = torch_decoding_one_step(

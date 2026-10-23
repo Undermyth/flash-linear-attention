@@ -8,6 +8,7 @@ from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices
 from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.op import exp2
 
+from . import debug_capture
 from .chunk_dh_kk_to_dk_backward import chunk_dh_kk_to_dk
 from .chunk_dh_kk_to_dk_gating_backward import chunk_dh_kk_to_dk_gating
 from .chunk_dk_backward import chunk_bwd_dk
@@ -602,7 +603,7 @@ class ChebyshevIteration(torch.autograd.Function):
                 chunk_indices=chunk_indices,
             )
 
-        x_out, fro, _, h_kk_final = chebyshev_iteration_forward_triton(
+        x_out, fro, h_kk_chunks, h_kk_final = chebyshev_iteration_forward_triton(
             k,
             q,
             gkk,
@@ -615,6 +616,16 @@ class ChebyshevIteration(torch.autograd.Function):
             h0=h0,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+        )
+
+        # Publish the solver internals (chunk-level `H` snapshots, the Chebyshev iterate and
+        # the per-position Frobenius norms) for offline analysis. This is a no-op unless the
+        # capture channel is enabled, so the training path stays untouched.
+        debug_capture.publish(
+            h_kk_chunks=h_kk_chunks,
+            x_out=x_out,
+            fro=fro,
+            gkk=gkk,
         )
 
         ctx.save_for_backward(k, x_out, fro, gkk, h0, chunk_indices)
